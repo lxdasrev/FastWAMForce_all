@@ -4,6 +4,18 @@ set -euo pipefail
 NPROC_PER_NODE="${1:?Usage: bash scripts/train.sh <nproc_per_node> [hydra_overrides...]}"
 shift
 
+if ! [[ "${NPROC_PER_NODE}" =~ ^[1-8]$ ]]; then
+  echo "Error: nproc_per_node must be an integer from 1 to 8, got ${NPROC_PER_NODE}." >&2
+  exit 1
+fi
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  IFS=',' read -r -a VISIBLE_GPU_LIST <<< "${CUDA_VISIBLE_DEVICES// /}"
+  if (( ${#VISIBLE_GPU_LIST[@]} != NPROC_PER_NODE )); then
+    echo "Error: nproc_per_node=${NPROC_PER_NODE} but CUDA_VISIBLE_DEVICES exposes ${#VISIBLE_GPU_LIST[@]} GPU(s)." >&2
+    exit 1
+  fi
+fi
+
 EXTRA_ARGS=("$@")
 NUM_MACHINES="${NNODES:-1}"
 MACHINE_RANK="${NODE_RANK:-0}"

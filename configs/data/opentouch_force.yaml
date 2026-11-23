@@ -1,0 +1,24 @@
+force_history_frames: 0
+
+train:
+  _target_: fastwam.datasets.opentouch.dataset.OpenTouchForceDataset
+  cache_dir: ${oc.env:OPENTOUCH_FORCE_CACHE,./data/opentouch_force_cache}
+  split: train
+  video_size: [224, 224]
+  force_history_frames: ${data.force_history_frames}
+  text_embedding_cache_dir: ${oc.env:OPENTOUCH_TEXT_CACHE,./data/text_embeds_cache/opentouch}
+  use_text_embed_cache: true
+  context_len: 128
+  strict_contract: true
+
+val:
+  _target_: fastwam.datasets.opentouch.dataset.OpenTouchForceDataset
+  cache_dir: ${oc.env:OPENTOUCH_FORCE_CACHE,./data/opentouch_force_cache}
+  split: val
+  video_size: [224, 224]
+  force_history_frames: ${data.train.force_history_frames}
+  text_embedding_cache_dir: ${oc.env:OPENTOUCH_TEXT_CACHE,./data/text_embeds_cache/opentouch}
+  use_text_embed_cache: true
+  context_len: 128
+  strict_contract: true
+

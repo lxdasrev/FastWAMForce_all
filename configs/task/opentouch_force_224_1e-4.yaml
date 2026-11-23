@@ -1,0 +1,30 @@
+# @package _global_
+
+defaults:
+  - override /data: opentouch_force
+  - override /model: fastwam_force
+  - _self_
+
+batch_size: 1
+num_workers: 4
+learning_rate: 1.0e-4
+lr_scheduler_type: cosine
+num_epochs: 1
+max_steps: 10000
+log_every: 100
+eval_every: 500
+save_every: 2000
+eval_num_inference_steps: 10
+gradient_accumulation_steps: 4
+mixed_precision: bf16
+weight_decay: 1.0e-2
+
+training:
+  stage: joint
+  force_warmup_steps: 1000
+  finetune_video: true
+  joint_eval_every: 2000
+  tactile_ablation_every: 2000
+
+model:
+  init_mode: pretrained

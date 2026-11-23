@@ -58,7 +58,8 @@ def _to_bool(value: Any) -> bool:
 
 def _iter_dataset_nodes(node: Any, path: str = "data"):
     if isinstance(node, DictConfig):
-        if "dataset_dirs" in node and node.get("dataset_dirs") is not None:
+        if (("dataset_dirs" in node and node.get("dataset_dirs") is not None)
+                or ("cache_dir" in node and node.get("cache_dir") is not None)):
             yield path, node
         for key, value in node.items():
             yield from _iter_dataset_nodes(value, f"{path}.{key}")
@@ -69,25 +70,32 @@ def _iter_dataset_nodes(node: Any, path: str = "data"):
 
 def _collect_dataset_settings(data_cfg: DictConfig):
     dataset_dirs: list[str] = []
+    manifest_dirs: list[str] = []
     cache_dirs: list[Path] = []
     context_lens = set()
 
     for node_path, node in _iter_dataset_nodes(data_cfg, path="data"):
         raw_dirs = node.get("dataset_dirs")
-        if raw_dirs is None:
+        manifest_dir = node.get("cache_dir")
+        if raw_dirs is None and manifest_dir is None:
             continue
 
         cache_dir = node.get("text_embedding_cache_dir")
         if cache_dir is None or not str(cache_dir).strip():
             raise ValueError(
                 f"Missing `text_embedding_cache_dir` for dataset node `{node_path}` "
-                "(this node defines `dataset_dirs`)."
+                "(this node defines a dataset source)."
             )
 
-        for ds in raw_dirs:
-            ds_str = str(ds)
-            if ds_str not in dataset_dirs:
-                dataset_dirs.append(ds_str)
+        if raw_dirs is not None:
+            for ds in raw_dirs:
+                ds_str = str(ds)
+                if ds_str not in dataset_dirs:
+                    dataset_dirs.append(ds_str)
+        if manifest_dir is not None:
+            manifest_str = str(manifest_dir)
+            if manifest_str not in manifest_dirs:
+                manifest_dirs.append(manifest_str)
 
         cache_dir_path = Path(str(cache_dir)).expanduser()
         if cache_dir_path not in cache_dirs:
@@ -97,9 +105,9 @@ def _collect_dataset_settings(data_cfg: DictConfig):
         if context_len is not None:
             context_lens.add(int(context_len))
 
-        logger.info("Discovered dataset node `%s` with %d dataset_dirs.", node_path, len(raw_dirs))
+        logger.info("Discovered dataset node `%s`.", node_path)
 
-    return dataset_dirs, cache_dirs, context_lens
+    return dataset_dirs, manifest_dirs, cache_dirs, context_lens
 
 
 def _resolve_context_len(context_lens: set[int]) -> int:
@@ -145,6 +153,31 @@ def _read_unique_prompts(dataset_dirs: list[str]) -> list[str]:
     return prompts
 
 
+def _read_manifest_prompts(manifest_dirs: list[str]) -> list[str]:
+    prompts, seen = [], set()
+    for cache_dir in manifest_dirs:
+        path = Path(cache_dir) / "split_manifest.json"
+        if not path.exists():
+            raise FileNotFoundError(f"Missing OpenTouch split manifest: {path}")
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        records = {record["sequence_id"]: record for record in manifest.get("records", [])}
+        for windows in manifest.get("windows", {}).values():
+            for window in windows:
+                if "prompt" in window:
+                    prompt = str(window["prompt"])
+                else:
+                    record = records[window["sequence_id"]]
+                    prompt = (
+                        f"Use the gripper to {str(record['action_label']).lower()} "
+                        f"the {str(record['object_name']).lower()}."
+                    )
+                if prompt not in seen:
+                    seen.add(prompt)
+                    prompts.append(prompt)
+    logger.info("Loaded %d unique prompts from %d cache manifests.", len(prompts), len(manifest_dirs))
+    return prompts
+
+
 def _get_override_prompt(override_instruction: Any) -> str | None:
     if override_instruction is None:
         return None
@@ -187,7 +220,7 @@ def main(cfg: DictConfig):
     if cfg.data is None:
         raise ValueError("`cfg.data` is required.")
 
-    dataset_dirs, cache_dirs, context_lens = _collect_dataset_settings(cfg.data)
+    dataset_dirs, manifest_dirs, cache_dirs, context_lens = _collect_dataset_settings(cfg.data)
     if not cache_dirs:
         raise ValueError("No `text_embedding_cache_dir` found under `cfg.data`.")
 
@@ -197,9 +230,10 @@ def main(cfg: DictConfig):
         prompts = [override_prompt]
         logger.info("Using override_instruction; skipping dataset scan and encoding exactly 1 prompt.")
     else:
-        if not dataset_dirs:
-            raise ValueError("No `dataset_dirs` found under `cfg.data`.")
-        prompts = _read_unique_prompts(dataset_dirs)
+        if not dataset_dirs and not manifest_dirs:
+            raise ValueError("No dataset source found under `cfg.data`.")
+        prompts = _read_unique_prompts(dataset_dirs) + _read_manifest_prompts(manifest_dirs)
+        prompts = list(dict.fromkeys(prompts))
     if not prompts:
         logger.warning("No prompts found from tasks.jsonl; nothing to do.")
         return

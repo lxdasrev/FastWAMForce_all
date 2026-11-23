@@ -1,5 +1,8 @@
+import hashlib
+from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,6 +11,8 @@ from PIL import Image
 from fastwam.utils.logging_config import get_logger
 
 from .action_dit import ActionDiT
+from .force_expert import ForceExpert, ForceExpertConfig, compute_force_flow_loss
+from .force_mot import ForceBridgeMoT
 from .helpers.loader import load_wan22_ti2v_5b_components
 from .mot import MoT
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
@@ -36,14 +41,19 @@ class FastWAM(torch.nn.Module):
         action_train_shift: float = 5.0,
         action_infer_shift: float = 5.0,
         action_num_train_timesteps: int = 1000,
+        force_train_shift: float = 1.0,
+        force_infer_shift: float = 1.0,
+        force_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        loss_lambda_force: float = 1.0,
         compile_training_denoise: bool = False,
     ):
         super().__init__()
         self.video_expert = video_expert
         self.action_expert = action_expert
         self.mot = mot
+        self.force_enabled = isinstance(mot, ForceBridgeMoT)
         # Keep trainer compatibility: optimizer and freeze logic use `model.dit`.
         self.dit = self.mot
 
@@ -77,6 +87,18 @@ class FastWAM(torch.nn.Module):
             num_train_timesteps=action_num_train_timesteps,
             shift=action_infer_shift,
         )
+        if self.force_enabled:
+            self.train_force_scheduler = WanContinuousFlowMatchScheduler(
+                num_train_timesteps=force_num_train_timesteps,
+                shift=force_train_shift,
+            )
+            self.infer_force_scheduler = WanContinuousFlowMatchScheduler(
+                num_train_timesteps=force_num_train_timesteps,
+                shift=force_infer_shift,
+            )
+        else:
+            self.train_force_scheduler = None
+            self.infer_force_scheduler = None
         # Optional aliases for consistency with Wan22Core naming.
         self.train_scheduler = self.train_video_scheduler
         self.infer_scheduler = self.infer_video_scheduler
@@ -85,6 +107,7 @@ class FastWAM(torch.nn.Module):
         self.torch_dtype = torch_dtype
         self.loss_lambda_video = float(loss_lambda_video)
         self.loss_lambda_action = float(loss_lambda_action)
+        self.loss_lambda_force = float(loss_lambda_force)
         self.compile_training_denoise = bool(compile_training_denoise)
         self.mot.compile_training_layers = self.compile_training_denoise
 
@@ -103,6 +126,8 @@ class FastWAM(torch.nn.Module):
         redirect_common_files: bool = True,
         video_dit_config: dict[str, Any] | None = None,
         action_dit_config: dict[str, Any] | None = None,
+        force_dit_config: dict[str, Any] | None = None,
+        force_to_backbone: dict[int, int] | None = None,
         action_dit_pretrained_path: str | None = None,
         skip_dit_load_from_pretrain: bool = False,
         mot_checkpoint_mixed_attn: bool = False,
@@ -112,8 +137,12 @@ class FastWAM(torch.nn.Module):
         action_train_shift: float = 5.0,
         action_infer_shift: float = 5.0,
         action_num_train_timesteps: int = 1000,
+        force_train_shift: float = 1.0,
+        force_infer_shift: float = 1.0,
+        force_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        loss_lambda_force: float = 1.0,
         compile_training_denoise: bool = False,
     ):
         if video_dit_config is None:
@@ -148,10 +177,24 @@ class FastWAM(torch.nn.Module):
         if int(len(action_expert.blocks)) != int(len(video_expert.blocks)):
             raise ValueError("ActionDiT `num_layers` must match video expert.")
 
-        mot = MoT(
-            mixtures={"video": video_expert, "action": action_expert},
-            mot_checkpoint_mixed_attn=mot_checkpoint_mixed_attn,
-        )
+        mixtures = {"video": video_expert, "action": action_expert}
+        if force_dit_config is not None:
+            force_cfg = dict(force_dit_config)
+            force_cfg.pop("enabled", None)
+            force_expert = ForceExpert(ForceExpertConfig(**force_cfg)).to(
+                device=device, dtype=torch_dtype
+            )
+            mot = ForceBridgeMoT(
+                mixtures=mixtures,
+                force_expert=force_expert,
+                force_to_backbone=force_to_backbone,
+                mot_checkpoint_mixed_attn=mot_checkpoint_mixed_attn,
+            )
+        else:
+            mot = MoT(
+                mixtures=mixtures,
+                mot_checkpoint_mixed_attn=mot_checkpoint_mixed_attn,
+            )
 
         model = cls(
             video_expert=video_expert,
@@ -170,8 +213,12 @@ class FastWAM(torch.nn.Module):
             action_train_shift=action_train_shift,
             action_infer_shift=action_infer_shift,
             action_num_train_timesteps=action_num_train_timesteps,
+            force_train_shift=force_train_shift,
+            force_infer_shift=force_infer_shift,
+            force_num_train_timesteps=force_num_train_timesteps,
             loss_lambda_video=loss_lambda_video,
             loss_lambda_action=loss_lambda_action,
+            loss_lambda_force=loss_lambda_force,
             compile_training_denoise=compile_training_denoise,
         )
         model.model_paths = {
@@ -300,8 +347,11 @@ class FastWAM(torch.nn.Module):
         if num_frames <= 1:
             raise ValueError(f"Video T must be > 1 for action-conditioned training, got T={num_frames}")
 
+        if "action" not in sample and "action_chunk" in sample:
+            sample = dict(sample)
+            sample["action"] = sample["action_chunk"]
         if "action" not in sample:
-            raise ValueError("`sample['action']` is required for FastWAM training.")
+            raise ValueError("`sample['action']` or `sample['action_chunk']` is required for FastWAM training.")
 
         action = sample["action"]
         if action.ndim != 3:
@@ -363,13 +413,17 @@ class FastWAM(torch.nn.Module):
         if self.proprio_encoder is not None:
             if proprio is None:
                 raise ValueError("`sample['proprio']` is required when `proprio_dim` is enabled.")
-            if proprio.ndim != 3:
-                raise ValueError(f"`sample['proprio']` must be 3D [B, T, d], got shape {tuple(proprio.shape)}")
-            if proprio.shape[2] != self.proprio_dim:
+            if proprio.ndim not in (2, 3):
                 raise ValueError(
-                    f"`sample['proprio']` last dim must be {self.proprio_dim}, got {proprio.shape[2]}"
+                    f"`sample['proprio']` must be [B,D] or [B,T,D], got shape {tuple(proprio.shape)}"
                 )
-            proprio = proprio[:, 0, :] # [B, D]
+            proprio_dim = proprio.shape[-1]
+            if proprio_dim != self.proprio_dim:
+                raise ValueError(
+                    f"`sample['proprio']` last dim must be {self.proprio_dim}, got {proprio_dim}"
+                )
+            if proprio.ndim == 3:
+                proprio = proprio[:, 0, :] # [B, D]
             context, context_mask = self._append_proprio_to_context(
                 context=context,
                 context_mask=context_mask,
@@ -382,7 +436,7 @@ class FastWAM(torch.nn.Module):
         if image_is_pad is not None:
             image_is_pad = image_is_pad.to(device=self.device, dtype=torch.bool, non_blocking=True)
 
-        return {
+        result = {
             "context": context,
             "context_mask": context_mask,
             "input_latents": input_latents,
@@ -392,6 +446,45 @@ class FastWAM(torch.nn.Module):
             "action_is_pad": action_is_pad,
             "image_is_pad": image_is_pad,
         }
+        if self.force_enabled:
+            force = sample.get("force")
+            force_valid = sample.get("force_valid")
+            force_is_pad = sample.get("force_is_pad")
+            observed = sample.get("force_observed_frames")
+            if force is None or force_valid is None or force_is_pad is None or observed is None:
+                raise ValueError(
+                    "Force-enabled training requires force, force_valid, force_is_pad, "
+                    "and force_observed_frames."
+                )
+            if force.ndim != 3 or force.shape[-1] != 2:
+                raise ValueError(f"sample force must be [B,T,2], got {tuple(force.shape)}")
+            if force_valid.shape != force.shape or force_is_pad.shape != force.shape:
+                raise ValueError("force_valid and force_is_pad must match force [B,T,2]")
+            if isinstance(observed, torch.Tensor):
+                observed_values = observed.reshape(-1).to(dtype=torch.long)
+                if not bool((observed_values == observed_values[0]).all()):
+                    raise ValueError("All samples in a batch must use the same force mode")
+                observed = int(observed_values[0].item())
+            else:
+                observed = int(observed)
+            if observed not in (1, 17):
+                raise ValueError(f"force_observed_frames must be 1 or 17, got {observed}")
+            if force.shape[1] != observed + 32:
+                raise ValueError(
+                    f"force length must be observed+32={observed + 32}, got {force.shape[1]}"
+                )
+            force = force.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+            force_valid = force_valid.to(device=self.device, dtype=torch.bool, non_blocking=True)
+            force_is_pad = force_is_pad.to(device=self.device, dtype=torch.bool, non_blocking=True)
+            effective_force_valid = force_valid & ~force_is_pad
+            result.update(
+                force=force,
+                force_valid=force_valid,
+                force_is_pad=force_is_pad,
+                effective_force_valid=effective_force_valid,
+                force_observed_frames=observed,
+            )
+        return result
 
     @torch.no_grad()
     def _build_mot_attention_mask(
@@ -519,6 +612,85 @@ class FastWAM(torch.nn.Module):
             self.action_expert.post(action_tokens),
         )
 
+    def _joint_force_denoise_core(
+        self,
+        latents_video: torch.Tensor,
+        latents_action: torch.Tensor,
+        latents_force: torch.Tensor,
+        timestep_video: torch.Tensor,
+        timestep_action: torch.Tensor,
+        timestep_force: torch.Tensor,
+        force_observed_frames: int,
+        effective_force_valid: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        attention_mask: torch.Tensor,
+        fuse_vae_embedding_in_latents: bool,
+        action_condition: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not self.force_enabled:
+            raise RuntimeError("_joint_force_denoise_core requires a ForceBridgeMoT model")
+        (
+            video_tokens,
+            t_video,
+            t_mod_video,
+            context_video,
+            context_mask_video,
+            freqs_video,
+            f_video,
+            h_video,
+            w_video,
+            tokens_per_frame,
+        ) = self.video_expert.prepare(
+            x=latents_video,
+            timestep=timestep_video,
+            context=context,
+            context_mask=context_mask,
+            action=action_condition,
+            fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
+        )
+        (
+            action_tokens,
+            _t_action,
+            t_mod_action,
+            context_action,
+            context_mask_action,
+            freqs_action,
+        ) = self.action_expert.prepare(
+            action_tokens=latents_action,
+            timestep=timestep_action,
+            context=context,
+            context_mask=context_mask,
+        )
+        force_state = self.mot.force_expert.prepare(
+            force=latents_force,
+            timestep=timestep_force,
+            observed_frames=force_observed_frames,
+            effective_valid=effective_force_valid,
+            context=context,
+            context_mask=context_mask,
+        )
+        video_tokens, action_tokens, force_state = self.mot.forward_joint_force_core(
+            video_tokens=video_tokens,
+            action_tokens=action_tokens,
+            force_state=force_state,
+            video_freqs=freqs_video,
+            action_freqs=freqs_action,
+            video_t_mod=t_mod_video,
+            action_t_mod=t_mod_action,
+            video_context=context_video,
+            video_context_mask=context_mask_video,
+            action_context=context_action,
+            action_context_mask=context_mask_action,
+            attention_mask=attention_mask,
+            first_frame_tokens=int(tokens_per_frame),
+        )
+        return (
+            self.video_expert.post(video_tokens, t_video, f_video, h_video, w_video),
+            self.action_expert.post(action_tokens),
+            self.mot.force_expert.post(force_state),
+        )
+
     def training_loss(self, sample, tiled: bool = False):
         inputs = self.build_inputs(sample, tiled=tiled)
         input_latents = inputs["input_latents"]
@@ -559,17 +731,52 @@ class FastWAM(torch.nn.Module):
             video_tokens_per_frame=tokens_per_frame,
             device=latents.device,
         )
-        pred_video, pred_action = self._joint_denoise_core(
-            latents_video=latents,
-            latents_action=noisy_action,
-            timestep_video=timestep_video,
-            timestep_action=timestep_action,
-            context=context,
-            context_mask=context_mask,
-            attention_mask=attention_mask,
-            fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
-            action_condition=action,
-        )
+        pred_force = target_force = timestep_force = None
+        if self.force_enabled:
+            clean_force = inputs["force"]
+            observed_frames = int(inputs["force_observed_frames"])
+            effective_force_valid = inputs["effective_force_valid"]
+            noise_force = torch.randn_like(clean_force)
+            timestep_force = self.train_force_scheduler.sample_training_t(
+                batch_size=batch_size,
+                device=self.device,
+                dtype=clean_force.dtype,
+            )
+            noisy_force = self.train_force_scheduler.add_noise(
+                clean_force, noise_force, timestep_force
+            )
+            noisy_force[:, :observed_frames] = clean_force[:, :observed_frames]
+            noisy_force = noisy_force * effective_force_valid.to(noisy_force.dtype)
+            target_force = self.train_force_scheduler.training_target(
+                clean_force, noise_force, timestep_force
+            )
+            pred_video, pred_action, pred_force = self._joint_force_denoise_core(
+                latents_video=latents,
+                latents_action=noisy_action,
+                latents_force=noisy_force,
+                timestep_video=timestep_video,
+                timestep_action=timestep_action,
+                timestep_force=timestep_force,
+                force_observed_frames=observed_frames,
+                effective_force_valid=effective_force_valid,
+                context=context,
+                context_mask=context_mask,
+                attention_mask=attention_mask,
+                fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
+                action_condition=action,
+            )
+        else:
+            pred_video, pred_action = self._joint_denoise_core(
+                latents_video=latents,
+                latents_action=noisy_action,
+                timestep_video=timestep_video,
+                timestep_action=timestep_action,
+                context=context,
+                context_mask=context_mask,
+                attention_mask=attention_mask,
+                fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
+                action_condition=action,
+            )
 
         include_initial_video_step = inputs["first_frame_latents"] is None
         if inputs["first_frame_latents"] is not None:
@@ -605,6 +812,53 @@ class FastWAM(torch.nn.Module):
             "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
             "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
         }
+        sigma_action = (timestep_action / float(self.train_action_scheduler.num_train_timesteps)).view(-1, 1, 1)
+        action_x0_hat = noisy_action - sigma_action * pred_action
+        action_valid_summary = torch.ones_like(action_x0_hat[..., 0], dtype=torch.bool)
+        if action_is_pad is not None:
+            action_valid_summary = ~action_is_pad
+        action_summary_mask = action_valid_summary.unsqueeze(-1).expand_as(action_x0_hat)
+        if bool(action_summary_mask.any()):
+            loss_dict.update(
+                action_x0_pred_mean=float(action_x0_hat[action_summary_mask].float().mean().detach().item()),
+                action_x0_gt_mean=float(action[action_summary_mask].float().mean().detach().item()),
+                action_x0_mse=float(
+                    (action_x0_hat[action_summary_mask].float() - action[action_summary_mask].float())
+                    .pow(2).mean().detach().item()
+                ),
+            )
+        if self.force_enabled:
+            observed_frames = int(inputs["force_observed_frames"])
+            valid_future = inputs["effective_force_valid"][:, observed_frames:]
+            force_terms = compute_force_flow_loss(
+                pred_force[:, observed_frames:],
+                target_force[:, observed_frames:],
+                valid_future,
+                self.train_force_scheduler.training_weight(timestep_force),
+                self.loss_lambda_force,
+            )
+            raw_force_loss = force_terms["raw_force_loss"]
+            scheduler_weighted_force_loss = force_terms["scheduler_weighted_force_loss"]
+            force_loss = force_terms["force_loss"]
+            loss_total = loss_total + force_loss
+            loss_dict.update(
+                raw_force_loss=float(raw_force_loss.detach().item()),
+                scheduler_weighted_force_loss=float(scheduler_weighted_force_loss.detach().item()),
+                force_loss=float(force_loss.detach().item()),
+                force_valid_future_ratio=float(force_terms["valid_ratio"].detach().item()),
+                force_valid_samples=float(force_terms["valid_samples"].detach().item()),
+            )
+            if bool(valid_future.any()):
+                sigma_force = (timestep_force / float(self.train_force_scheduler.num_train_timesteps)).view(-1, 1, 1)
+                force_x0_hat = noisy_force - sigma_force * pred_force
+                force_mask = valid_future
+                pred_values = force_x0_hat[:, observed_frames:][force_mask].float()
+                gt_values = inputs["force"][:, observed_frames:][force_mask].float()
+                loss_dict.update(
+                    force_x0_pred_mean=float(pred_values.mean().detach().item()),
+                    force_x0_gt_mean=float(gt_values.mean().detach().item()),
+                    force_x0_mse=float((pred_values - gt_values).pow(2).mean().detach().item()),
+                )
         return loss_total, loss_dict
 
     @torch.no_grad()
@@ -1159,6 +1413,202 @@ class FastWAM(torch.nn.Module):
         }
 
     @torch.no_grad()
+    def infer_action_force(
+        self,
+        prompt: Optional[str],
+        input_image: torch.Tensor,
+        observed_force: torch.Tensor,
+        observed_force_valid: Optional[torch.Tensor] = None,
+        proprio: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
+        num_inference_steps: int = 10,
+        action_sigma_shift: Optional[float] = None,
+        force_sigma_shift: Optional[float] = None,
+        seed: Optional[int] = None,
+        rand_device: str = "cpu",
+        tiled: bool = False,
+        normalization: Optional[dict[str, Any] | str] = None,
+    ) -> dict[str, Any]:
+        """Jointly generate 32 future actions and force frames without video.
+
+        ``observed_force`` is normalized according to the checkpoint-bound data
+        contract and has shape ``[1,2]`` or ``[17,2]`` (batch dimension is also
+        accepted). Future force and action start from independent Gaussian noise.
+        """
+        if not self.force_enabled or not isinstance(self.mot, ForceBridgeMoT):
+            raise RuntimeError("infer_action_force requires a ForceBridgeMoT model")
+        self.eval()
+        if input_image.ndim == 3:
+            input_image = input_image.unsqueeze(0)
+        if input_image.ndim != 4 or input_image.shape[:2] != (1, 3):
+            raise ValueError(f"input_image must be [3,H,W] or [1,3,H,W], got {tuple(input_image.shape)}")
+        if input_image.shape[-2] % 16 or input_image.shape[-1] % 16:
+            raise ValueError("input_image height and width must be multiples of 16")
+        if observed_force.ndim == 2:
+            observed_force = observed_force.unsqueeze(0)
+        if observed_force.ndim != 3 or observed_force.shape[0] != 1 or observed_force.shape[2] != 2:
+            raise ValueError(f"observed_force must be [O,2] or [1,O,2], got {tuple(observed_force.shape)}")
+        observed_frames = int(observed_force.shape[1])
+        if observed_frames not in (1, 17):
+            raise ValueError(f"observed_force length must be 1 or 17, got {observed_frames}")
+        if observed_force_valid is None:
+            observed_force_valid = torch.isfinite(observed_force)
+        elif observed_force_valid.ndim == 2:
+            observed_force_valid = observed_force_valid.unsqueeze(0)
+        if observed_force_valid.shape != observed_force.shape:
+            raise ValueError("observed_force_valid must have the same shape as observed_force")
+        observed_force = observed_force.to(device=self.device, dtype=self.torch_dtype)
+        observed_force_valid = observed_force_valid.to(device=self.device, dtype=torch.bool)
+        observed_force = torch.where(observed_force_valid, observed_force, torch.zeros_like(observed_force))
+
+        if proprio is not None:
+            if self.proprio_dim is None:
+                raise ValueError("proprio was supplied but proprio_dim is disabled")
+            if proprio.ndim == 1:
+                proprio = proprio.unsqueeze(0)
+            if tuple(proprio.shape) != (1, self.proprio_dim):
+                raise ValueError(f"proprio must be [8] or [1,8], got {tuple(proprio.shape)}")
+            proprio = proprio.to(device=self.device, dtype=self.torch_dtype)
+
+        use_prompt = prompt is not None
+        use_context = context is not None or context_mask is not None
+        if use_prompt == use_context:
+            raise ValueError("provide exactly one of prompt or context/context_mask")
+        if use_prompt:
+            context, context_mask = self.encode_prompt(prompt)
+        else:
+            if context is None or context_mask is None:
+                raise ValueError("context and context_mask must be supplied together")
+            if context.ndim == 2:
+                context = context.unsqueeze(0)
+            if context_mask.ndim == 1:
+                context_mask = context_mask.unsqueeze(0)
+            context = context.to(device=self.device, dtype=self.torch_dtype)
+            context_mask = context_mask.to(device=self.device, dtype=torch.bool)
+        if proprio is not None:
+            context, context_mask = self._append_proprio_to_context(context, context_mask, proprio)
+
+        action_generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
+        force_generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed + 1)
+        latents_action = torch.randn(
+            (1, 32, self.action_expert.action_dim), generator=action_generator,
+            device=rand_device, dtype=torch.float32,
+        ).to(device=self.device, dtype=self.torch_dtype)
+        future_force = torch.randn(
+            (1, 32, 2), generator=force_generator, device=rand_device, dtype=torch.float32,
+        ).to(device=self.device, dtype=self.torch_dtype)
+        latents_force = torch.cat((observed_force, future_force), dim=1)
+        force_valid = torch.cat(
+            (observed_force_valid, torch.ones_like(future_force, dtype=torch.bool)), dim=1
+        )
+
+        input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
+        first_frame_latents = self._encode_input_image_latents_tensor(input_image, tiled=tiled)
+        timestep_video = torch.zeros(1, dtype=first_frame_latents.dtype, device=self.device)
+        fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
+        (
+            video_tokens, _, video_t_mod, video_context, video_context_mask,
+            video_freqs, _, _, _, tokens_per_frame,
+        ) = self.video_expert.prepare(
+            x=first_frame_latents,
+            timestep=timestep_video,
+            context=context,
+            context_mask=context_mask,
+            action=None,
+            fuse_vae_embedding_in_latents=fuse_flag,
+        )
+        video_seq_len = int(video_tokens.shape[1])
+        va_mask = self._build_mot_attention_mask(
+            video_seq_len=video_seq_len,
+            action_seq_len=32,
+            video_tokens_per_frame=int(tokens_per_frame),
+            device=self.device,
+        )
+        video_cache_k, video_cache_v = self.mot.prefill_video_cache_tensor(
+            video_tokens=video_tokens,
+            video_freqs=video_freqs,
+            video_t_mod=video_t_mod,
+            video_context=video_context,
+            video_context_mask=video_context_mask,
+            video_attention_mask=va_mask[:video_seq_len, :video_seq_len],
+        )
+        action_mask = va_mask[video_seq_len:, :]
+        action_times, action_deltas = self.infer_action_scheduler.build_inference_schedule(
+            num_inference_steps, self.device, latents_action.dtype, action_sigma_shift
+        )
+        force_times, force_deltas = self.infer_force_scheduler.build_inference_schedule(
+            num_inference_steps, self.device, latents_force.dtype, force_sigma_shift
+        )
+        for ta, da, tf, df in zip(action_times, action_deltas, force_times, force_deltas):
+            action_t = ta.unsqueeze(0).to(device=self.device, dtype=latents_action.dtype)
+            force_t = tf.unsqueeze(0).to(device=self.device, dtype=latents_force.dtype)
+            action_tokens, _, action_mod, action_context, action_context_mask, action_freqs = self.action_expert.prepare(
+                action_tokens=latents_action,
+                timestep=action_t,
+                context=context,
+                context_mask=context_mask,
+            )
+            force_state = self.mot.force_expert.prepare(
+                force=latents_force,
+                timestep=force_t,
+                observed_frames=observed_frames,
+                effective_valid=force_valid,
+                context=context,
+                context_mask=context_mask,
+            )
+            action_tokens, force_state = self.mot.forward_action_force_with_video_cache(
+                action_tokens=action_tokens,
+                action_freqs=action_freqs,
+                action_t_mod=action_mod,
+                action_context=action_context,
+                action_context_mask=action_context_mask,
+                force_state=force_state,
+                video_cache_k=video_cache_k,
+                video_cache_v=video_cache_v,
+                action_attention_mask=action_mask,
+            )
+            pred_action = self.action_expert.post(action_tokens)
+            pred_force = self.mot.force_expert.post(force_state)
+            latents_action = self.infer_action_scheduler.step(pred_action, da, latents_action)
+            latents_force = self.infer_force_scheduler.step(pred_force, df, latents_force)
+            latents_force[:, :observed_frames] = observed_force
+
+        action_normalized = latents_action[0].float().cpu()
+        force_normalized = latents_force[0, observed_frames:].float().cpu()
+        result = {
+            "action_normalized": action_normalized,
+            "future_force_normalized": force_normalized,
+            # Backward-friendly aliases explicitly remain normalized.
+            "action": action_normalized,
+            "future_force": force_normalized,
+        }
+        if normalization is not None:
+            if isinstance(normalization, (str, Path)):
+                normalization_path = Path(normalization)
+                expected_normalization = getattr(self, "loaded_contract_hashes", None)
+                if expected_normalization and "normalization.npz" in expected_normalization:
+                    actual = hashlib.sha256(normalization_path.read_bytes()).hexdigest()
+                    expected = expected_normalization["normalization.npz"]
+                    if actual != expected:
+                        raise ValueError(
+                            f"inference normalization does not match checkpoint contract: {actual} != {expected}"
+                        )
+                normalization = dict(np.load(normalization))
+            action_mean = torch.as_tensor(normalization["action_mean"], dtype=torch.float32)
+            action_scale = torch.as_tensor(normalization["action_scale"], dtype=torch.float32)
+            force_median = torch.as_tensor(normalization["force_median"], dtype=torch.float32)
+            force_scale = torch.as_tensor(normalization["force_scale"], dtype=torch.float32)
+            asinh_scale = torch.as_tensor(normalization["force_asinh_scale"], dtype=torch.float32)
+            deadzone = torch.as_tensor(normalization["force_deadzone"], dtype=torch.float32)
+            result["action_denormalized"] = action_normalized * action_scale + action_mean
+            compressed = force_normalized * force_scale + force_median
+            result["future_force_denormalized"] = torch.clamp(
+                torch.sinh(compressed) * asinh_scale + deadzone, min=0.0
+            )
+        return result
+
+    @torch.no_grad()
     def infer(
         self,
         prompt: Optional[str],
@@ -1196,11 +1646,12 @@ class FastWAM(torch.nn.Module):
             tiled=tiled,
         )
 
-    def save_checkpoint(self, path, optimizer=None, step=None):
+    def save_checkpoint(self, path, optimizer=None, step=None, contract_hashes=None):
         payload = {
             "mot": self.mot.state_dict(),
             "step": step,
             "torch_dtype": str(self.torch_dtype),
+            "contract_hashes": contract_hashes,
         }
         if self.proprio_encoder is not None:
             payload["proprio_encoder"] = self.proprio_encoder.state_dict()
@@ -1208,15 +1659,42 @@ class FastWAM(torch.nn.Module):
             payload["optimizer"] = optimizer.state_dict()
         torch.save(payload, path)
 
-    def load_checkpoint(self, path, optimizer=None):
-        payload = torch.load(path, map_location="cpu")
+    def load_checkpoint(self, path, optimizer=None, strict_contract: bool = True):
+        checkpoint_path = Path(path)
+        if checkpoint_path.is_dir():
+            checkpoint_path = checkpoint_path / "model.pt"
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"checkpoint not found: {checkpoint_path}")
+        payload = torch.load(checkpoint_path, map_location="cpu")
+        expected_hashes = payload.get("contract_hashes")
+        self.loaded_contract_hashes = expected_hashes
+        if expected_hashes:
+            bundle_dir = checkpoint_path.parent
+            for name, expected in expected_hashes.items():
+                artifact = bundle_dir / name
+                if not artifact.exists():
+                    if strict_contract:
+                        raise FileNotFoundError(f"checkpoint data-contract artifact missing: {artifact}")
+                    logger.warning("Missing checkpoint data-contract artifact: %s", artifact)
+                    continue
+                digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+                if digest != expected:
+                    message = f"checkpoint data-contract mismatch for {name}: {digest} != {expected}"
+                    if strict_contract:
+                        raise ValueError(message)
+                    logger.warning(message)
+        elif strict_contract and self.force_enabled:
+            raise ValueError(
+                "Force checkpoint has no bound data contract. Use it only as an explicit initialization "
+                "source with strict_contract=False, never as a strict resume."
+            )
         if "mot" in payload:
             self.mot.load_state_dict(payload["mot"], strict=False)
         elif "dit" in payload:
             logger.warning("Loading legacy `dit` checkpoint into video expert only.")
             self.video_expert.load_state_dict(payload["dit"], strict=False)
         else:
-            raise ValueError(f"Checkpoint missing both `mot` and `dit` keys: {path}")
+            raise ValueError(f"Checkpoint missing both `mot` and `dit` keys: {checkpoint_path}")
         if self.proprio_encoder is not None:
             if "proprio_encoder" in payload:
                 self.proprio_encoder.load_state_dict(payload["proprio_encoder"], strict=True)

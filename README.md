@@ -1,5 +1,9 @@
 # FastWAM
 
+> This fork includes the OpenTouch two-finger ForceExpert path. See
+> [docs/FASTWAM_FORCE.md](docs/FASTWAM_FORCE.md) for conversion, training,
+> checkpoint-contract and joint action+force inference instructions.
+
 Official codebase for **Fast-WAM: Do World Action Models Need Test-time Future Imagination?**
 
 [![English](https://img.shields.io/badge/README-English-111111.svg)](./README.md)

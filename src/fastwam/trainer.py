@@ -1,8 +1,10 @@
 import logging
 import json
+import hashlib
 import inspect
 import os
 import re
+import shutil
 from math import ceil
 from pathlib import Path
 import time
@@ -21,6 +23,7 @@ from .utils.pytorch_utils import set_global_seed
 from .utils.samplers import ResumableEpochSampler
 from .utils.video_io import save_mp4
 from .utils.video_metrics import pil_frames_to_video_tensor, video_psnr, video_ssim
+from .evaluation.force_ablation import future_force_to_action
 
 logger = get_logger(__name__)
 
@@ -55,6 +58,9 @@ class Wan22Trainer:
                 "Expected one of: ['no', 'fp16', 'bf16']."
             )
         self.wandb_enabled = bool(cfg.wandb.enabled)
+        training_cfg = cfg.get("training", {})
+        self.training_stage = str(training_cfg.get("stage", "joint")).strip().lower()
+        self.finetune_video = bool(training_cfg.get("finetune_video", True))
 
         self.accelerator = Accelerator(
             gradient_accumulation_steps=self.gradient_accumulation_steps,
@@ -82,10 +88,13 @@ class Wan22Trainer:
         # Freeze non-trainable modules before optimizer/deepspeed initialization.
         # This keeps DiT (+ optional proprio encoder) as trainable when ZeRO builds optimizer state.
         self._apply_dit_only_train_mode(self.model)
+        # Keep a stable optimizer parameter-group layout across force_warmup ->
+        # joint resumes. Frozen parameters receive no gradients/state during
+        # warmup, but must already be present so Accelerate can restore exactly.
         trainable_params = list(self.model.dit.parameters())
         proprio_encoder = getattr(self.model, "proprio_encoder", None)
         if proprio_encoder is not None:
-            trainable_params.extend(list(proprio_encoder.parameters()))
+            trainable_params.extend(proprio_encoder.parameters())
         self.optimizer = torch.optim.AdamW(
             trainable_params,
             lr=self.learning_rate,
@@ -291,8 +300,15 @@ class Wan22Trainer:
             return
         resume_path = Path(str(resume))
         if resume_path.is_dir():
-            logger.info("Resuming full training state from directory: %s", resume)
-            self.load_training_state(str(resume_path))
+            if (resume_path / "trainer_state.json").exists():
+                logger.info("Resuming full training state from directory: %s", resume)
+                self.load_training_state(str(resume_path))
+            elif (resume_path / "model.pt").exists():
+                logger.info("Loading strict weight bundle from directory: %s", resume)
+                self._validate_resume_contract(resume_path)
+                self.accelerator.unwrap_model(self.model).load_checkpoint(str(resume_path), optimizer=None)
+            else:
+                raise FileNotFoundError(f"resume directory has neither trainer_state.json nor model.pt: {resume}")
             return
         if not resume_path.exists():
             raise FileNotFoundError(f"Resume checkpoint not found: {resume}")
@@ -306,25 +322,61 @@ class Wan22Trainer:
         model = self.accelerator.unwrap_model(self.model)
         self._apply_dit_only_train_mode(model)
 
-    @staticmethod
-    def _apply_dit_only_train_mode(model):
+    def _apply_dit_only_train_mode(self, model):
         model.eval()
         model.requires_grad_(False)
-        model.dit.train()
-        model.dit.requires_grad_(True)
+        if not getattr(model, "force_enabled", False):
+            model.dit.train()
+            model.dit.requires_grad_(True)
+        else:
+            if self.training_stage not in {"force_warmup", "joint"}:
+                raise ValueError("training.stage must be force_warmup or joint for a force model")
+            if not hasattr(model, "_configured_loss_lambdas"):
+                model._configured_loss_lambdas = (
+                    model.loss_lambda_video, model.loss_lambda_action, model.loss_lambda_force
+                )
+            configured_video, configured_action, configured_force = model._configured_loss_lambdas
+            force_expert = model.dit.force_expert
+            force_expert.train()
+            force_expert.requires_grad_(True)
+            if self.training_stage == "force_warmup":
+                model.loss_lambda_video = 0.0
+                model.loss_lambda_action = 0.0
+                model.loss_lambda_force = configured_force
+            else:
+                model.loss_lambda_video = configured_video
+                model.loss_lambda_action = configured_action
+                model.loss_lambda_force = configured_force
+                model.action_expert.train()
+                model.action_expert.requires_grad_(True)
+                model.dit.bridge_gates.requires_grad_(True)
+                if self.finetune_video:
+                    model.video_expert.train()
+                    model.video_expert.requires_grad_(True)
         proprio_encoder = getattr(model, "proprio_encoder", None)
-        if proprio_encoder is not None:
+        if proprio_encoder is not None and (not getattr(model, "force_enabled", False) or self.training_stage == "joint"):
             proprio_encoder.train()
             proprio_encoder.requires_grad_(True)
+        logger.info(
+            "Configured training stage=%s finetune_video=%s trainable_params=%d",
+            self.training_stage,
+            self.finetune_video,
+            sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad),
+        )
 
     @staticmethod
     def _to_batched_eval_sample(sample):
         video = sample["video"]
         prompt = sample["prompt"]
         action = sample.get("action", None)
+        action_is_pad = sample.get("action_is_pad", None)
         proprio = sample.get("proprio", None)
         context = sample.get("context", None)
         context_mask = sample.get("context_mask", None)
+        force = sample.get("force", None)
+        force_valid = sample.get("force_valid", None)
+        force_is_pad = sample.get("force_is_pad", None)
+        force_observed_frames = sample.get("force_observed_frames", None)
 
         if not isinstance(video, torch.Tensor):
             raise TypeError(
@@ -363,16 +415,32 @@ class Wan22Trainer:
             if action.shape[1] % (num_video_frames - 1) != 0:
                 raise ValueError(f"`sample['action']` temporal dimension must be divisible by video frames-1={num_video_frames - 1}, got {action.shape[1]}")
             action_horizon = int(action.shape[1])
+            if action_is_pad is not None and action_is_pad.ndim == 1:
+                action_is_pad = action_is_pad.unsqueeze(0)
 
         proprio = None
         if "proprio" in sample:
             proprio = sample["proprio"]
             if not isinstance(proprio, torch.Tensor):
                 raise TypeError(f"`sample['proprio']` must be a torch.Tensor, got {type(proprio)}")
-            if proprio.ndim == 2:
+            if proprio.ndim == 1:
                 proprio = proprio.unsqueeze(0)
-            if proprio.ndim != 3:
-                raise ValueError(f"`sample['proprio']` must be 3D [B, T, d], got shape {tuple(proprio.shape)}")
+            elif proprio.ndim == 2:
+                proprio = proprio.unsqueeze(0)
+            if proprio.ndim not in (2, 3):
+                raise ValueError(f"sample proprio must batch to [B,D] or [B,T,D], got {tuple(proprio.shape)}")
+
+        if force is not None:
+            if force.ndim == 2:
+                force = force.unsqueeze(0)
+            if force_valid.ndim == 2:
+                force_valid = force_valid.unsqueeze(0)
+            if force_is_pad.ndim == 2:
+                force_is_pad = force_is_pad.unsqueeze(0)
+            if force.ndim != 3 or force_valid.shape != force.shape or force_is_pad.shape != force.shape:
+                raise ValueError("force/force_valid/force_is_pad must batch to identical [B,T,2] shapes")
+            if isinstance(force_observed_frames, torch.Tensor):
+                force_observed_frames = int(force_observed_frames.item())
 
         if context is not None or context_mask is not None:
             if context is None or context_mask is None:
@@ -390,10 +458,15 @@ class Wan22Trainer:
             "video": video,
             "prompt": prompt,
             "action": action,
+            "action_is_pad": action_is_pad,
             "proprio": proprio,
             "context": context,
             "context_mask": context_mask,
             "action_horizon": action_horizon,
+            "force": force,
+            "force_valid": force_valid,
+            "force_is_pad": force_is_pad,
+            "force_observed_frames": force_observed_frames,
         }
 
     @torch.no_grad()
@@ -405,9 +478,9 @@ class Wan22Trainer:
         was_dit_training = model.dit.training
         model.eval()
 
-        # eval_index = (self.global_step + self.accelerator.process_index) % len(self.val_dataset)
-        rng = torch.Generator(device="cpu").manual_seed(self.global_step + self.accelerator.process_index)
-        eval_index = torch.randint(0, len(self.val_dataset), (1,), generator=rng).item()
+        # Keep a rank-specific but step-invariant validation item so tactile
+        # ablations remain paired across checkpoints.
+        eval_index = (self.seed + self.accelerator.process_index) % len(self.val_dataset)
         sample = self._to_batched_eval_sample(self.val_dataset[eval_index])
 
         # 1. training loss
@@ -418,9 +491,87 @@ class Wan22Trainer:
         prompt = sample["prompt"][0]
         video0 = sample["video"][0] # Tensor [3, T, H, W] in (-1, 1)
         action = sample["action"][0] if "action" in sample and sample["action"] is not None else None
-        proprio = sample["proprio"][0, 0] if "proprio" in sample and sample["proprio"] is not None else None # from [1, T, d] to [d]
+        proprio = None
+        if sample.get("proprio") is not None:
+            proprio_batch = sample["proprio"]
+            proprio = proprio_batch[0] if proprio_batch.ndim == 2 else proprio_batch[0, 0]
         input_image = video0[:, 0].unsqueeze(0)
         _, num_frames, _, _ = video0.shape
+
+        force_action_mse = force_future_mse = None
+        force_ablation_metrics = None
+        joint_eval_every = int(self.cfg.get("training", {}).get("joint_eval_every", 2000))
+        if (
+            getattr(model, "force_enabled", False)
+            and sample.get("force") is not None
+            and joint_eval_every > 0
+            and self.global_step % joint_eval_every == 0
+        ):
+            observed = int(sample["force_observed_frames"])
+            force_kwargs = {
+                "prompt": None if sample["context"] is not None else prompt,
+                "context": sample["context"][0] if sample["context"] is not None else None,
+                "context_mask": sample["context_mask"][0] if sample["context_mask"] is not None else None,
+                "input_image": input_image,
+                "observed_force": sample["force"][0, :observed],
+                "observed_force_valid": sample["force_valid"][0, :observed],
+                "proprio": proprio,
+                "num_inference_steps": self.eval_num_inference_steps,
+                "seed": 42,
+            }
+            generated = model.infer_action_force(**force_kwargs)
+            pred_action_force = generated["action_normalized"]
+            pred_future_force = generated["future_force_normalized"]
+            gt_action_force = sample["action"][0].float().cpu()
+            gt_future_force = sample["force"][0, observed:].float().cpu()
+            action_valid = (
+                ~sample["action_is_pad"][0].bool().cpu()
+                if sample.get("action_is_pad") is not None else torch.ones(32, dtype=torch.bool)
+            )
+            force_valid = sample["force_valid"][0, observed:].bool().cpu()
+            force_action_mse = (pred_action_force[action_valid] - gt_action_force[action_valid]).pow(2).mean().item()
+            force_future_mse = (
+                (pred_future_force[force_valid] - gt_future_force[force_valid]).pow(2).mean().item()
+                if bool(force_valid.any()) else 0.0
+            )
+            force_ablation_metrics = {"correct": force_action_mse}
+
+            def run_ablation(observed_force, observed_valid, *, reads_future=True, ablation_seed=42):
+                kwargs = dict(force_kwargs)
+                kwargs["observed_force"] = observed_force
+                kwargs["observed_force_valid"] = observed_valid
+                kwargs["seed"] = ablation_seed
+                with future_force_to_action(model, reads_future):
+                    output = model.infer_action_force(**kwargs)["action_normalized"]
+                return (output[action_valid] - gt_action_force[action_valid]).pow(2).mean().item()
+
+            observed_force = sample["force"][0, :observed]
+            observed_valid = sample["force_valid"][0, :observed]
+            force_ablation_metrics["zero"] = run_ablation(
+                torch.zeros_like(observed_force), observed_valid
+            )
+            shuffled_index = (eval_index + max(1, len(self.val_dataset) // 2)) % len(self.val_dataset)
+            shuffled_sample = self.val_dataset[shuffled_index]
+            shuffled_force = shuffled_sample["force"][:observed]
+            shuffled_valid = shuffled_sample["force_valid"][:observed]
+            force_ablation_metrics["batch_shuffle"] = run_ablation(
+                shuffled_force, shuffled_valid
+            )
+            if observed == 17:
+                history_order = torch.randperm(16, generator=torch.Generator().manual_seed(45))
+                order = torch.cat((history_order, torch.tensor([16])))
+                force_ablation_metrics["time_shuffle"] = run_ablation(
+                    observed_force[order], observed_valid[order]
+                )
+            force_ablation_metrics["disable_future_force_to_action"] = run_ablation(
+                observed_force, observed_valid, reads_future=False
+            )
+            np.savez_compressed(
+                os.path.join(self.eval_dir, f"joint_force_step_{self.global_step:06d}_rank_{self.accelerator.process_index:03d}.npz"),
+                action_pred=pred_action_force.numpy(), action_gt=gt_action_force.numpy(),
+                force_pred=pred_future_force.numpy(), force_gt=gt_future_force.numpy(),
+                force_valid=force_valid.numpy(),
+            )
 
         # 2. inference and video saving
         infer_kwargs = {
@@ -585,13 +736,62 @@ class Wan22Trainer:
             result["action_l2"] = float(action_l2_mean)
         if action_l1_mean is not None:
             result["action_l1"] = float(action_l1_mean)
+        if force_action_mse is not None:
+            force_metrics = torch.tensor(
+                [force_action_mse, force_future_mse], device=self.accelerator.device, dtype=torch.float32
+            ).unsqueeze(0)
+            force_metrics = self.accelerator.gather_for_metrics(force_metrics).mean(dim=0)
+            result["joint_force_action_mse"] = float(force_metrics[0].item())
+            result["joint_force_future_mse"] = float(force_metrics[1].item())
+            for name, value in force_ablation_metrics.items():
+                metric = torch.tensor(value, device=self.accelerator.device, dtype=torch.float32).reshape(1)
+                result[f"force_ablation_{name}_action_mse"] = float(
+                    self.accelerator.gather_for_metrics(metric).mean().item()
+                )
         return result
 
     def _save_weights_checkpoint(self, step_tag: str):
         model = self.accelerator.unwrap_model(self.model)
-        ckpt_path = os.path.join(self.weights_dir, f"{step_tag}.pt")
-        model.save_checkpoint(ckpt_path, optimizer=None, step=self.global_step)
-        return ckpt_path
+        bundle_dir = Path(self.weights_dir) / step_tag
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+        contract_hashes = self._copy_data_contract(bundle_dir)
+        ckpt_path = bundle_dir / "model.pt"
+        model.save_checkpoint(
+            str(ckpt_path), optimizer=None, step=self.global_step, contract_hashes=contract_hashes
+        )
+        return str(bundle_dir)
+
+    def _copy_data_contract(self, destination: Path) -> dict[str, str] | None:
+        cache_dir = getattr(self.train_dataset, "cache_dir", None)
+        if cache_dir is None:
+            return None
+        source_dir = Path(cache_dir)
+        names = ("normalization.npz", "data_contract.json", "split_manifest.json", "contract_hashes.json")
+        hashes = {}
+        for name in names:
+            source = source_dir / name
+            if not source.exists():
+                raise FileNotFoundError(f"training dataset contract artifact missing: {source}")
+            target = destination / name
+            shutil.copy2(source, target)
+            hashes[name] = hashlib.sha256(target.read_bytes()).hexdigest()
+        return hashes
+
+    def _validate_resume_contract(self, checkpoint_dir: Path) -> None:
+        cache_dir = getattr(self.train_dataset, "cache_dir", None)
+        if cache_dir is None:
+            return
+        for name in ("normalization.npz", "data_contract.json", "split_manifest.json"):
+            saved = checkpoint_dir / name
+            current = Path(cache_dir) / name
+            if not saved.exists():
+                raise FileNotFoundError(f"strict Force resume requires {saved}")
+            saved_hash = hashlib.sha256(saved.read_bytes()).hexdigest()
+            current_hash = hashlib.sha256(current.read_bytes()).hexdigest()
+            if saved_hash != current_hash:
+                raise ValueError(
+                    f"strict Force resume contract mismatch for {name}: {saved_hash} != {current_hash}"
+                )
 
     def _save_trainer_state(self, state_path: str):
         state_file = os.path.join(state_path, "trainer_state.json")
@@ -617,11 +817,13 @@ class Wan22Trainer:
         self.accelerator.save_state(output_dir=state_path)
         if self.accelerator.is_main_process:
             self._save_trainer_state(state_path)
+            self._copy_data_contract(Path(state_path))
         self.accelerator.wait_for_everyone()
 
         return {"weights_path": ckpt_path, "state_path": state_path}
 
     def load_training_state(self, state_dir: str):
+        self._validate_resume_contract(Path(state_dir))
         self.accelerator.load_state(input_dir=state_dir)
         state_file = Path(state_dir) / "trainer_state.json"
         if state_file.exists():
@@ -699,6 +901,17 @@ class Wan22Trainer:
 
                 if self.accelerator.sync_gradients:
                     grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    bridge_diag_snapshot = None
+                    diagnostics_fn = getattr(self.accelerator.unwrap_model(self.model).dit, "bridge_diagnostics", None)
+                    if diagnostics_fn is not None:
+                        bridge_diag_snapshot = {}
+                        for bridge, values in diagnostics_fn().items():
+                            bridge_diag_snapshot[bridge] = {
+                                "raw": float(values["raw"].float().item()),
+                                "tanh": float(values["tanh"].float().item()),
+                                "grad": 0.0 if values["grad"] is None else float(values["grad"].float().item()),
+                                "residual_rms": 0.0 if values["residual_rms"] is None else float(values["residual_rms"].float().item()),
+                            }
                     self.optimizer.step()
                     if not self.accelerator.optimizer_step_was_skipped:
                         self.scheduler.step()
@@ -746,6 +959,12 @@ class Wan22Trainer:
                         }
                         for key, value in global_loss_metrics.items():
                             wandb_payload[f"train/{key}"] = value
+                        if bridge_diag_snapshot is not None:
+                            for bridge, values in bridge_diag_snapshot.items():
+                                wandb_payload[f"bridge/{bridge}/raw_gate"] = values["raw"]
+                                wandb_payload[f"bridge/{bridge}/tanh_gate"] = values["tanh"]
+                                wandb_payload[f"bridge/{bridge}/grad"] = values["grad"]
+                                wandb_payload[f"bridge/{bridge}/residual_rms"] = values["residual_rms"]
                         self._wandb_log(wandb_payload)
 
                     if (
@@ -766,6 +985,13 @@ class Wan22Trainer:
                                 description += " action_l2=%.4f" % metrics["action_l2"]
                             if "action_l1" in metrics:
                                 description += " action_l1=%.4f" % metrics["action_l1"]
+                            if "joint_force_action_mse" in metrics:
+                                description += " force_action_mse=%.4f force_future_mse=%.4f" % (
+                                    metrics["joint_force_action_mse"], metrics["joint_force_future_mse"]
+                                )
+                                for key, value in metrics.items():
+                                    if key.startswith("force_ablation_"):
+                                        description += f" {key}={value:.4f}"
                             logger.info(description)
                             eval_payload = {
                                 "eval/val_loss": float(metrics["val_loss"]),
@@ -780,6 +1006,12 @@ class Wan22Trainer:
                                 eval_payload["eval/action_l2"] = float(metrics["action_l2"])
                             if "action_l1" in metrics:
                                 eval_payload["eval/action_l1"] = float(metrics["action_l1"])
+                            if "joint_force_action_mse" in metrics:
+                                eval_payload["eval/joint_force_action_mse"] = metrics["joint_force_action_mse"]
+                                eval_payload["eval/joint_force_future_mse"] = metrics["joint_force_future_mse"]
+                                for key, value in metrics.items():
+                                    if key.startswith("force_ablation_"):
+                                        eval_payload[f"eval/{key}"] = value
                             self._wandb_log(eval_payload)
 
                     if self.save_every > 0 and self.global_step % self.save_every == 0:
