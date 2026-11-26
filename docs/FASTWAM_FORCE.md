@@ -59,8 +59,10 @@ batch_size=1 gradient_accumulation_steps=4 max_steps=10000
 ```
 
 For the two explicit phases, first run
-`training.stage=force_warmup max_steps=1000`, then resume a strict training-state
-directory with `training.stage=joint max_steps=10000`. Warmup trains only the
+`training.stage=force_warmup max_steps=1000`, then load the warmup weight bundle
+with `training.stage=joint max_steps=10000`. A weight bundle intentionally starts
+a new joint optimizer/scheduler; a state directory is only for interruption
+recovery within the same stage. Warmup trains only the
 ForceExpert (including force-side bridge projections) and zeroes video/action
 loss weights. Joint training enables ActionExpert, ForceExpert, bridge gates,
 and proprio encoder; `training.finetune_video=false` freezes VideoExpert.
@@ -84,3 +86,33 @@ current, caches only the current video's 30-layer K/V, and jointly denoises 32
 actions and 32 future force frames. It never generates future video. Supplying
 `normalization.npz` returns both normalized and contract-denormalized tensors.
 The original `infer_action` remains the no-force baseline.
+
+## Evaluation
+
+OpenTouch validation never calls the legacy future-video rollout. Every
+`eval_every` steps it evaluates deterministic flow losses on 64 fixed,
+sequence-group-stratified windows. Every `training.joint_eval_every` steps it
+jointly generates action/force on 16 fixed contact groups; tactile ablations are
+controlled independently by `training.tactile_ablation_every`. Warmup reports
+force loss and, when the generation cadence is reached, future-force metrics
+without treating its untrained action as an effect metric. A model configured without ForceExpert uses
+`infer_action` as the action-only baseline. Both 1-frame and 17-frame observed
+force modes are inferred from the cache contract.
+
+Run a strict checkpoint-bound offline evaluation with one non-overlapping
+contact window per validation sequence group:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+python scripts/evaluate_opentouch.py \
+  task=opentouch_force_224_1e-4 \
+  evaluation.checkpoint=/path/to/checkpoints/weights/step_010000 \
+  evaluation.output_dir=/path/to/offline_eval
+```
+
+Use `data.val.split=test` for the test split. The command writes normalized and
+canonical action predictions, normalized and relative-pressure force
+predictions, effective masks, identifiers, aggregate metrics and a 10,000-draw
+paired sequence-group bootstrap summary. The primary success rule requires the
+correct-force action MSE to improve by at least 2% over both zero and shuffled
+force, with a positive 95% confidence-interval lower bound.

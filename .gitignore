@@ -12,6 +12,8 @@ evaluate_results/
 
 volc/
 tests/
+!tests/
+!tests/test_*.py
 
 # ai coding
 .codex/

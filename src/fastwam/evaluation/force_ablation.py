@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -80,3 +81,53 @@ def paired_group_bootstrap(
         "num_groups": int(len(unique)),
         "passes_2pct": bool(group_gain.mean() >= 0.02 and low > 0),
     }
+
+
+def summarize_bootstrap_outputs(
+    eval_dir: str | Path,
+    *,
+    samples: int = 10000,
+    seed: int = 42,
+) -> dict[str, object]:
+    """Aggregate rank-local OpenTouch NPZ files and run paired group bootstraps."""
+    paths = sorted(Path(eval_dir).glob("opentouch_generation_step_*_rank_*.npz"))
+    if not paths:
+        raise FileNotFoundError(f"no OpenTouch generation results found in {eval_dir}")
+    merged: dict[str, list[np.ndarray]] = {}
+    for path in paths:
+        with np.load(path) as payload:
+            for name in payload.files:
+                merged.setdefault(name, []).append(np.asarray(payload[name]))
+    arrays = {name: np.concatenate(values, axis=0) for name, values in merged.items()}
+    groups = arrays.get("split_group", np.asarray([]))
+    summary: dict[str, object] = {
+        "num_examples": int(len(groups)),
+        "num_groups": int(len(np.unique(groups))),
+        "bootstrap_samples": int(samples),
+        "seed": int(seed),
+        "ablations": {},
+    }
+    correct = arrays.get("correct_action_mse")
+    if correct is None or not len(groups):
+        summary["passes_success_criterion"] = False
+        return summary
+    for name in (
+        "zero_action_mse",
+        "batch_shuffle_action_mse",
+        "time_shuffle_action_mse",
+        "disable_future_force_to_action_action_mse",
+    ):
+        ablated = arrays.get(name)
+        if ablated is None:
+            continue
+        valid = np.isfinite(correct) & np.isfinite(ablated)
+        if not bool(valid.any()):
+            continue
+        summary["ablations"][name.removesuffix("_action_mse")] = paired_group_bootstrap(
+            correct[valid], ablated[valid], groups[valid], samples=samples, seed=seed
+        )
+    required = [summary["ablations"].get(name) for name in ("zero", "batch_shuffle")]
+    summary["passes_success_criterion"] = bool(
+        all(item is not None and item["passes_2pct"] for item in required)
+    )
+    return summary
