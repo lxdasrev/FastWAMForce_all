@@ -19,6 +19,8 @@ from .canonical import normalize_force
 class OpenTouchForceDataset(torch.utils.data.Dataset):
     """Return synchronized 9-frame video, 32 actions and 33/49 force frames."""
 
+    is_opentouch_force_dataset = True
+
     def __init__(
         self,
         cache_dir,
@@ -61,7 +63,9 @@ class OpenTouchForceDataset(torch.utils.data.Dataset):
         self.records = {
             record["sequence_id"]: record for record in self.manifest.get("records", [])
         }
+        self.normalization_path = stats_path
         self.stats = dict(np.load(stats_path))
+        self.contract_hashes = json.loads(hashes_path.read_text(encoding="utf-8"))
         if strict_contract:
             self._validate_hashes(hashes_path)
             contract_history = int(self.contract["force_history_frames"])
@@ -100,6 +104,92 @@ class OpenTouchForceDataset(torch.utils.data.Dataset):
 
     def __len__(self):
         return len(self.windows)
+
+    @staticmethod
+    def _stat_like(value, reference):
+        if isinstance(reference, torch.Tensor):
+            return torch.as_tensor(value, device=reference.device, dtype=reference.dtype)
+        return np.asarray(value, dtype=np.asarray(reference).dtype)
+
+    def denormalize_action(self, action):
+        """Invert the checkpoint-bound seven-dimensional action normalization."""
+        mean = self._stat_like(self.stats["action_mean"], action)
+        scale = self._stat_like(self.stats["action_scale"], action)
+        return action * scale + mean
+
+    def denormalize_force(self, force):
+        """Invert robust/asinh normalization to two-finger relative pressure."""
+        median = self._stat_like(self.stats["force_median"], force)
+        scale = self._stat_like(self.stats["force_scale"], force)
+        asinh_scale = self._stat_like(self.stats["force_asinh_scale"], force)
+        deadzone = self._stat_like(self.stats["force_deadzone"], force)
+        compressed = force * scale + median
+        if isinstance(force, torch.Tensor):
+            return torch.clamp(torch.sinh(compressed) * asinh_scale + deadzone, min=0.0)
+        return np.maximum(np.sinh(compressed) * asinh_scale + deadzone, 0.0)
+
+    def _window_group(self, item: dict) -> str:
+        record = self.records.get(item["sequence_id"], {})
+        return str(item.get("split_group", record.get("split_group", item["sequence_id"])))
+
+    def _window_has_contact(self, item: dict) -> bool:
+        record = self.records.get(item["sequence_id"], {})
+        cache_file = item.get("cache_file", record.get("cache_file"))
+        if cache_file is None:
+            return False
+        current = int(item["current_frame"])
+        start = current - self.force_history_frames
+        stop = current + 33
+        with np.load(self.cache_dir / cache_file) as cache:
+            force = np.asarray(cache["force_raw"][start:stop], dtype=np.float32)
+            valid = np.asarray(cache["force_valid"][start:stop], dtype=bool)
+        deadzone = np.asarray(self.stats["force_deadzone"], dtype=np.float32)
+        return bool(np.any(valid & (force > deadzone)))
+
+    def fixed_eval_indices(
+        self,
+        count: int,
+        *,
+        seed: int = 42,
+        contact_only: bool = False,
+        unique_groups: bool = False,
+    ) -> list[int]:
+        """Select deterministic, sequence-group-stratified validation indices."""
+        count = max(0, min(int(count), len(self.windows)))
+        if count == 0:
+            return []
+        grouped: dict[str, list[int]] = {}
+        for index, item in enumerate(self.windows):
+            grouped.setdefault(self._window_group(item), []).append(index)
+
+        def stable_key(value: str) -> str:
+            return hashlib.sha256(f"{seed}:{value}".encode("utf-8")).hexdigest()
+
+        group_names = sorted(grouped, key=stable_key)
+        for group in group_names:
+            grouped[group].sort(key=lambda index: stable_key(f"{group}:{index}"))
+        selected: list[int] = []
+        selected_groups: set[str] = set()
+        depth = 0
+        while len(selected) < count:
+            added = False
+            for group in group_names:
+                if unique_groups and group in selected_groups:
+                    continue
+                candidates = grouped[group]
+                if depth >= len(candidates):
+                    continue
+                index = candidates[depth]
+                if not contact_only or self._window_has_contact(self.windows[index]):
+                    selected.append(index)
+                    selected_groups.add(group)
+                    if len(selected) == count:
+                        break
+                added = True
+            if not added:
+                break
+            depth += 1
+        return selected
 
     def _source_path(self, item: dict) -> Path:
         source = Path(item["source_file"])
@@ -194,6 +284,7 @@ class OpenTouchForceDataset(torch.utils.data.Dataset):
             "image_is_pad": torch.zeros(9, dtype=torch.bool),
             "sequence_id": item["sequence_id"],
             "current_frame": current,
+            "split_group": self._window_group(item),
         }
         if self.use_text_embed_cache:
             result["context"], result["context_mask"] = self._get_cached_text_context(prompt)

@@ -22,9 +22,18 @@ weight_decay: 1.0e-2
 training:
   stage: joint
   force_warmup_steps: 1000
-  finetune_video: true
+  finetune_video: false
   joint_eval_every: 2000
   tactile_ablation_every: 2000
+
+evaluation:
+  loss_samples: 64
+  generation_samples: 16
+  checkpoint: null
+  output_dir: null
+  offline_loss_samples: 0
+  offline_generation_samples: 0
+  bootstrap_samples: 10000
 
 model:
   init_mode: pretrained

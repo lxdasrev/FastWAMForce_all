@@ -183,8 +183,9 @@ FastWAM/
 conda create -n fastwam python=3.10 -y
 conda activate fastwam
 pip install -U pip
-pip install torch==2.7.1+cu128 torchvision==0.22.1+cu128 --extra-index-url https://download.pytorch.org/whl/cu128
-pip install -e .
+python -m pip install torch==2.7.1+cu128 torchvision==0.22.1+cu128 torchaudio==2.7.1+cu128 --index-url https://download.pytorch.org/whl/cu128
+python -m pip install -e .
+python -c "import torch, torchvision; print(torch.__version__, torchvision.__version__, torch.version.cuda, torch.cuda.is_available()); print((torch.ones(1, device='cuda') + 1).item())"
 ```
 
 ## Model Preparation

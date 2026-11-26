@@ -24,11 +24,45 @@ from .utils.samplers import ResumableEpochSampler
 from .utils.video_io import save_mp4
 from .utils.video_metrics import pil_frames_to_video_tensor, video_psnr, video_ssim
 from .evaluation.force_ablation import future_force_to_action
+from .evaluation.opentouch_metrics import add_action_metrics, add_force_metrics, add_pair
 
 logger = get_logger(__name__)
 
 
 class Wan22Trainer:
+    @classmethod
+    def evaluation_only(cls, model, val_dataset, *, cfg: DictConfig, accelerator: Accelerator, output_dir: str):
+        """Build a lightweight evaluator without optimizer or training dataloaders."""
+        instance = cls.__new__(cls)
+        instance.model = model
+        instance.val_dataset = val_dataset
+        instance.cfg = cfg
+        instance.accelerator = accelerator
+        instance.output_dir = str(output_dir)
+        instance.eval_dir = os.path.join(instance.output_dir, "eval")
+        ensure_dir(instance.output_dir)
+        ensure_dir(instance.eval_dir)
+        instance.seed = int(cfg.seed)
+        instance.eval_num_inference_steps = int(cfg.eval_num_inference_steps)
+        training_cfg = cfg.get("training", {})
+        evaluation_cfg = cfg.get("evaluation", {})
+        instance.training_stage = str(training_cfg.get("stage", "joint")).strip().lower()
+        instance.finetune_video = bool(training_cfg.get("finetune_video", True))
+        instance.joint_eval_every = 1
+        instance.tactile_ablation_every = 1
+        configured_loss = int(evaluation_cfg.get("offline_loss_samples", 0))
+        instance.eval_loss_samples = configured_loss or len(val_dataset)
+        configured_generation = int(evaluation_cfg.get("offline_generation_samples", 0))
+        instance.eval_generation_samples = configured_generation or len(val_dataset)
+        instance.global_step = 1
+        # Match the train-time stage semantics before running loss validation.
+        # In particular, force_warmup must not report video/action losses as
+        # part of its total merely because this lightweight runner skips the
+        # regular trainer constructor.
+        instance._configure_stage_loss_lambdas(model)
+        model.eval()
+        return instance
+
     def __init__(self, model, train_dataset, val_dataset=None, *, cfg: DictConfig):
         self.model = model
         self.train_dataset = train_dataset
@@ -61,6 +95,11 @@ class Wan22Trainer:
         training_cfg = cfg.get("training", {})
         self.training_stage = str(training_cfg.get("stage", "joint")).strip().lower()
         self.finetune_video = bool(training_cfg.get("finetune_video", True))
+        self.joint_eval_every = int(training_cfg.get("joint_eval_every", 2000))
+        self.tactile_ablation_every = int(training_cfg.get("tactile_ablation_every", 2000))
+        evaluation_cfg = cfg.get("evaluation", {})
+        self.eval_loss_samples = int(evaluation_cfg.get("loss_samples", 64))
+        self.eval_generation_samples = int(evaluation_cfg.get("generation_samples", 16))
 
         self.accelerator = Accelerator(
             gradient_accumulation_steps=self.gradient_accumulation_steps,
@@ -331,22 +370,11 @@ class Wan22Trainer:
         else:
             if self.training_stage not in {"force_warmup", "joint"}:
                 raise ValueError("training.stage must be force_warmup or joint for a force model")
-            if not hasattr(model, "_configured_loss_lambdas"):
-                model._configured_loss_lambdas = (
-                    model.loss_lambda_video, model.loss_lambda_action, model.loss_lambda_force
-                )
-            configured_video, configured_action, configured_force = model._configured_loss_lambdas
+            self._configure_stage_loss_lambdas(model)
             force_expert = model.dit.force_expert
             force_expert.train()
             force_expert.requires_grad_(True)
-            if self.training_stage == "force_warmup":
-                model.loss_lambda_video = 0.0
-                model.loss_lambda_action = 0.0
-                model.loss_lambda_force = configured_force
-            else:
-                model.loss_lambda_video = configured_video
-                model.loss_lambda_action = configured_action
-                model.loss_lambda_force = configured_force
+            if self.training_stage != "force_warmup":
                 model.action_expert.train()
                 model.action_expert.requires_grad_(True)
                 model.dit.bridge_gates.requires_grad_(True)
@@ -363,6 +391,25 @@ class Wan22Trainer:
             self.finetune_video,
             sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad),
         )
+
+    def _configure_stage_loss_lambdas(self, model) -> None:
+        """Apply warmup/joint loss semantics without changing trainable state."""
+        if not getattr(model, "force_enabled", False):
+            return
+        if self.training_stage not in {"force_warmup", "joint"}:
+            raise ValueError("training.stage must be force_warmup or joint for a force model")
+        if not hasattr(model, "_configured_loss_lambdas"):
+            model._configured_loss_lambdas = (
+                model.loss_lambda_video, model.loss_lambda_action, model.loss_lambda_force
+            )
+        configured_video, configured_action, configured_force = model._configured_loss_lambdas
+        if self.training_stage == "force_warmup":
+            model.loss_lambda_video = 0.0
+            model.loss_lambda_action = 0.0
+        else:
+            model.loss_lambda_video = configured_video
+            model.loss_lambda_action = configured_action
+        model.loss_lambda_force = configured_force
 
     @staticmethod
     def _to_batched_eval_sample(sample):
@@ -431,6 +478,8 @@ class Wan22Trainer:
                 raise ValueError(f"sample proprio must batch to [B,D] or [B,T,D], got {tuple(proprio.shape)}")
 
         if force is not None:
+            if force_valid is None or force_is_pad is None:
+                raise ValueError("force_valid and force_is_pad are required whenever force is present")
             if force.ndim == 2:
                 force = force.unsqueeze(0)
             if force_valid.ndim == 2:
@@ -467,10 +516,406 @@ class Wan22Trainer:
             "force_valid": force_valid,
             "force_is_pad": force_is_pad,
             "force_observed_frames": force_observed_frames,
+            "sequence_id": sample.get("sequence_id"),
+            "current_frame": sample.get("current_frame"),
+            "split_group": sample.get("split_group", sample.get("sequence_id")),
         }
+
+    def _distributed_finalize_pairs(self, pairs: dict[str, tuple[float, float]]) -> dict[str, float]:
+        names = sorted(pairs)
+        if not names:
+            return {}
+        local = torch.tensor(
+            [[pairs[name][0], pairs[name][1]] for name in names],
+            device=self.accelerator.device,
+            dtype=torch.float64,
+        )
+        gathered = self.accelerator.gather(local).reshape(-1, len(names), 2).sum(dim=0).cpu()
+        result = {}
+        for index, name in enumerate(names):
+            numerator, denominator = gathered[index].tolist()
+            result[name] = float(numerator / denominator) if denominator > 0 else 0.0
+            result[f"{name}_count"] = float(denominator)
+        return result
+
+    def _rank_eval_indices(self, count: int, *, contact_only: bool) -> tuple[list[int], list[int]]:
+        indices = self.val_dataset.fixed_eval_indices(
+            count,
+            seed=self.seed,
+            contact_only=contact_only,
+            unique_groups=contact_only,
+        )
+        if contact_only and not indices:
+            logger.warning("No contact validation windows were found; falling back to all validation windows.")
+            indices = self.val_dataset.fixed_eval_indices(
+                count, seed=self.seed, contact_only=False, unique_groups=contact_only
+            )
+        rank = int(self.accelerator.process_index)
+        world = int(self.accelerator.num_processes)
+        return indices, indices[rank::world]
+
+    @staticmethod
+    def _sample_context_kwargs(sample: dict) -> dict:
+        if sample["context"] is not None:
+            return {
+                "prompt": None,
+                "context": sample["context"][0],
+                "context_mask": sample["context_mask"][0],
+            }
+        return {"prompt": sample["prompt"][0], "context": None, "context_mask": None}
+
+    def _evaluate_opentouch_losses(self, model) -> dict[str, float]:
+        _, local_indices = self._rank_eval_indices(self.eval_loss_samples, contact_only=False)
+        pairs: dict[str, tuple[float, float]] = {}
+        for index in local_indices:
+            sample = self._to_batched_eval_sample(self.val_dataset[index])
+            cuda_devices = []
+            if torch.cuda.is_available():
+                device = torch.device(model.device)
+                cuda_devices = [device.index if device.index is not None else torch.cuda.current_device()]
+            with torch.random.fork_rng(devices=cuda_devices):
+                sample_seed = self.seed * 1_000_003 + int(index)
+                torch.manual_seed(sample_seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(sample_seed)
+                with self.accelerator.autocast():
+                    loss, loss_dict = model.training_loss(sample)
+            add_pair(pairs, "val_loss", float(loss.float().item()), 1.0)
+            for name, value in loss_dict.items():
+                add_pair(pairs, f"val_{name}", float(value), 1.0)
+
+            if sample.get("action_is_pad") is not None:
+                valid = ~sample["action_is_pad"].bool()
+                add_pair(pairs, "action_valid_ratio", valid.sum().item(), valid.numel())
+            if sample.get("force") is not None:
+                effective = sample["force_valid"].bool() & ~sample["force_is_pad"].bool()
+                add_pair(pairs, "force_valid_ratio", effective.sum().item(), effective.numel())
+        add_pair(
+            pairs,
+            "loss_eval_samples",
+            len(local_indices),
+            1.0 / max(int(self.accelerator.num_processes), 1),
+        )
+        return self._distributed_finalize_pairs(pairs)
+
+    def _run_force_action_inference(self, model, sample: dict, *, observed_force=None, observed_valid=None,
+                                    reads_future: bool = True) -> dict:
+        observed = int(sample["force_observed_frames"])
+        if observed not in (1, 17):
+            raise ValueError(f"OpenTouch observed force length must be 1 or 17, got {observed}")
+        if observed != int(self.val_dataset.force_observed_frames):
+            raise ValueError(
+                f"force history contract mismatch: sample={observed}, dataset={self.val_dataset.force_observed_frames}"
+            )
+        if observed_force is None:
+            observed_force = sample["force"][0, :observed]
+        if observed_valid is None:
+            observed_valid = (
+                sample["force_valid"][0, :observed].bool()
+                & ~sample["force_is_pad"][0, :observed].bool()
+            )
+        video0 = sample["video"][0]
+        proprio_batch = sample.get("proprio")
+        proprio = None if proprio_batch is None else (
+            proprio_batch[0] if proprio_batch.ndim == 2 else proprio_batch[0, 0]
+        )
+        kwargs = {
+            **self._sample_context_kwargs(sample),
+            "input_image": video0[:, 0].unsqueeze(0),
+            "observed_force": observed_force,
+            "observed_force_valid": observed_valid,
+            "proprio": proprio,
+            "num_inference_steps": self.eval_num_inference_steps,
+            "seed": 42,
+            "normalization": str(self.val_dataset.normalization_path),
+        }
+        with future_force_to_action(model, reads_future):
+            return model.infer_action_force(**kwargs)
+
+    def _run_action_only_inference(self, model, sample: dict) -> torch.Tensor:
+        video0 = sample["video"][0]
+        proprio_batch = sample.get("proprio")
+        proprio = None if proprio_batch is None else (
+            proprio_batch[0] if proprio_batch.ndim == 2 else proprio_batch[0, 0]
+        )
+        output = model.infer_action(
+            **self._sample_context_kwargs(sample),
+            input_image=video0[:, 0].unsqueeze(0),
+            action_horizon=int(sample["action_horizon"]),
+            proprio=proprio,
+            num_inference_steps=self.eval_num_inference_steps,
+            seed=42,
+        )
+        return output["action"]
+
+    def _evaluate_opentouch_generation(
+        self,
+        model,
+        *,
+        run_ablation: bool,
+        report_action: bool = True,
+    ) -> dict[str, float]:
+        all_indices, local_indices = self._rank_eval_indices(
+            self.eval_generation_samples, contact_only=True
+        )
+        pairs: dict[str, tuple[float, float]] = {}
+        saved: dict[str, list] = {
+            "sequence_id": [], "current_frame": [], "split_group": [],
+            "action_pred_normalized": [], "action_gt_normalized": [], "action_valid": [],
+            "action_pred_canonical": [], "action_gt_canonical": [],
+        }
+        sample_mse: dict[str, list[float]] = {}
+        force_enabled = bool(getattr(model, "force_enabled", False))
+        metric_prefixes = ["generation_"] if report_action else []
+        if run_ablation and force_enabled:
+            metric_prefixes.extend(
+                [
+                    "ablation_zero_",
+                    "ablation_disable_future_force_to_action_",
+                    "ablation_batch_shuffle_",
+                ]
+            )
+            if int(getattr(self.val_dataset, "force_observed_frames", 1)) == 17:
+                metric_prefixes.append("ablation_time_shuffle_")
+        for prefix in metric_prefixes:
+            for name in (
+                "action_mse_normalized",
+                "translation_mse_canonical",
+                "rotation_mse_canonical",
+                "gripper_mae_canonical",
+            ):
+                pairs[f"{prefix}{name}"] = (0.0, 0.0)
+        if force_enabled:
+            pairs["generation_force_mse_normalized"] = (0.0, 0.0)
+            pairs["generation_force_mae_relative_pressure"] = (0.0, 0.0)
+            pairs["generation_force_valid_ratio"] = (0.0, 0.0)
+
+        for local_position, index in enumerate(local_indices):
+            sample = self._to_batched_eval_sample(self.val_dataset[index])
+            action_gt = sample["action"][0].float().cpu()
+            action_valid = (
+                ~sample["action_is_pad"][0].bool().cpu()
+                if sample.get("action_is_pad") is not None
+                else torch.ones(action_gt.shape[0], dtype=torch.bool)
+            )
+            if force_enabled:
+                generated = self._run_force_action_inference(model, sample)
+                action_pred = generated["action_normalized"]
+            else:
+                generated = None
+                action_pred = self._run_action_only_inference(model, sample)
+
+            if report_action:
+                correct_mse = add_action_metrics(
+                    pairs,
+                    prefix="generation_",
+                    pred_normalized=action_pred,
+                    target_normalized=action_gt,
+                    valid_steps=action_valid,
+                    denormalize=self.val_dataset.denormalize_action,
+                )
+                sample_mse.setdefault("correct_action_mse", []).append(
+                    np.nan if correct_mse is None else correct_mse
+                )
+
+            saved["sequence_id"].append(str(sample["sequence_id"]))
+            saved["current_frame"].append(int(sample["current_frame"]))
+            saved["split_group"].append(str(sample["split_group"]))
+            saved["action_pred_normalized"].append(action_pred.numpy())
+            saved["action_gt_normalized"].append(action_gt.numpy())
+            saved["action_valid"].append(action_valid.numpy())
+            saved["action_pred_canonical"].append(
+                self.val_dataset.denormalize_action(action_pred).numpy()
+            )
+            saved["action_gt_canonical"].append(
+                self.val_dataset.denormalize_action(action_gt).numpy()
+            )
+
+            if not force_enabled:
+                continue
+            observed = int(sample["force_observed_frames"])
+            future_gt = sample["force"][0, observed:].float().cpu()
+            effective_future = (
+                sample["force_valid"][0, observed:].bool().cpu()
+                & ~sample["force_is_pad"][0, observed:].bool().cpu()
+            )
+            future_pred = generated["future_force_normalized"]
+            add_force_metrics(
+                pairs,
+                prefix="generation_",
+                pred_normalized=future_pred,
+                target_normalized=future_gt,
+                effective_valid=effective_future,
+                denormalize=self.val_dataset.denormalize_force,
+            )
+            add_pair(pairs, "generation_force_valid_ratio", effective_future.sum().item(), effective_future.numel())
+            for key in (
+                "force_pred_normalized", "force_gt_normalized", "effective_force_valid",
+                "force_pred_relative_pressure", "force_gt_relative_pressure",
+                "observed_force_normalized", "observed_force_valid",
+            ):
+                saved.setdefault(key, [])
+            saved["force_pred_normalized"].append(future_pred.numpy())
+            saved["force_gt_normalized"].append(future_gt.numpy())
+            saved["effective_force_valid"].append(effective_future.numpy())
+            saved["force_pred_relative_pressure"].append(
+                self.val_dataset.denormalize_force(future_pred).numpy()
+            )
+            saved["force_gt_relative_pressure"].append(
+                self.val_dataset.denormalize_force(future_gt).numpy()
+            )
+            saved["observed_force_normalized"].append(sample["force"][0, :observed].numpy())
+            saved["observed_force_valid"].append(
+                (
+                    sample["force_valid"][0, :observed].bool()
+                    & ~sample["force_is_pad"][0, :observed].bool()
+                ).numpy()
+            )
+
+            if not run_ablation:
+                continue
+            observed_force = sample["force"][0, :observed]
+            observed_valid = (
+                sample["force_valid"][0, :observed].bool()
+                & ~sample["force_is_pad"][0, :observed].bool()
+            )
+            variants = {
+                "zero": (torch.zeros_like(observed_force), observed_valid, True),
+                "disable_future_force_to_action": (observed_force, observed_valid, False),
+            }
+            if len(all_indices) > 1:
+                global_position = all_indices.index(index)
+                shuffled_index = all_indices[(global_position + 1) % len(all_indices)]
+                shuffled = self._to_batched_eval_sample(self.val_dataset[shuffled_index])
+                variants["batch_shuffle"] = (
+                    shuffled["force"][0, :observed],
+                    shuffled["force_valid"][0, :observed].bool()
+                    & ~shuffled["force_is_pad"][0, :observed].bool(),
+                    True,
+                )
+            if observed == 17:
+                order = torch.randperm(16, generator=torch.Generator().manual_seed(45))
+                order = torch.cat((order, torch.tensor([16])))
+                variants["time_shuffle"] = (observed_force[order], observed_valid[order], True)
+
+            for name, (variant_force, variant_valid, reads_future) in variants.items():
+                output = self._run_force_action_inference(
+                    model,
+                    sample,
+                    observed_force=variant_force,
+                    observed_valid=variant_valid,
+                    reads_future=reads_future,
+                )
+                variant_action = output["action_normalized"]
+                mse = add_action_metrics(
+                    pairs,
+                    prefix=f"ablation_{name}_",
+                    pred_normalized=variant_action,
+                    target_normalized=action_gt,
+                    valid_steps=action_valid,
+                    denormalize=self.val_dataset.denormalize_action,
+                )
+                sample_mse.setdefault(f"{name}_action_mse", []).append(
+                    np.nan if mse is None else mse
+                )
+                saved.setdefault(f"action_pred_{name}_normalized", []).append(variant_action.numpy())
+                saved.setdefault(f"action_pred_{name}_canonical", []).append(
+                    self.val_dataset.denormalize_action(variant_action).numpy()
+                )
+
+        add_pair(
+            pairs,
+            "generation_samples",
+            len(local_indices),
+            1.0 / max(int(self.accelerator.num_processes), 1),
+        )
+        if saved["sequence_id"]:
+            output_path = Path(self.eval_dir) / (
+                f"opentouch_generation_step_{self.global_step:06d}_rank_{self.accelerator.process_index:03d}.npz"
+            )
+            payload = {}
+            for name, values in saved.items():
+                if name in {"sequence_id", "split_group"}:
+                    payload[name] = np.asarray(values, dtype=str)
+                else:
+                    payload[name] = np.asarray(values)
+            payload.update({name: np.asarray(values, dtype=np.float64) for name, values in sample_mse.items()})
+            np.savez_compressed(output_path, **payload)
+            metadata = {
+                "step": int(self.global_step),
+                "split": str(getattr(self.val_dataset, "split", "val")),
+                "training_stage": self.training_stage,
+                "finetune_video": self.finetune_video,
+                "force_enabled": force_enabled,
+                "force_history_frames": int(getattr(self.val_dataset, "force_history_frames", 0)),
+                "init_mode": str(self.cfg.get("model", {}).get("init_mode", "unknown")),
+                "model_id": str(self.cfg.get("model", {}).get("model_id", "unknown")),
+                "action_dit_pretrained_path": self.cfg.get("model", {}).get(
+                    "action_dit_pretrained_path"
+                ),
+                "contract_hashes": getattr(self.val_dataset, "contract_hashes", {}),
+            }
+            output_path.with_suffix(".json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        return self._distributed_finalize_pairs(pairs)
 
     @torch.no_grad()
     def evaluate(self):
+        if self.val_dataset is None:
+            return None
+        if not bool(getattr(self.val_dataset, "is_opentouch_force_dataset", False)):
+            return self._evaluate_lerobot()
+
+        model = self.accelerator.unwrap_model(self.model)
+        was_dit_training = model.dit.training
+        model.eval()
+        try:
+            metrics = self._evaluate_opentouch_losses(model)
+            joint_due = self.joint_eval_every > 0 and self.global_step % self.joint_eval_every == 0
+            ablation_due = (
+                self.tactile_ablation_every > 0
+                and self.global_step % self.tactile_ablation_every == 0
+            )
+            force_enabled = bool(getattr(model, "force_enabled", False))
+            warmup_force_generation = self.training_stage == "force_warmup" and force_enabled and joint_due
+            regular_generation = self.training_stage != "force_warmup" and (joint_due or ablation_due)
+            if warmup_force_generation or regular_generation:
+                metrics.update(
+                    self._evaluate_opentouch_generation(
+                        model,
+                        run_ablation=bool(
+                            self.training_stage != "force_warmup" and ablation_due and force_enabled
+                        ),
+                        report_action=self.training_stage != "force_warmup",
+                    )
+                )
+            metrics["video_expert_trainable"] = float(self.finetune_video)
+            metrics["force_history_frames"] = float(self.val_dataset.force_history_frames)
+            if self.accelerator.is_main_process:
+                metadata = {
+                    "step": int(self.global_step),
+                    "training_stage": self.training_stage,
+                    "finetune_video": self.finetune_video,
+                    "force_enabled": bool(getattr(model, "force_enabled", False)),
+                    "force_history_frames": int(self.val_dataset.force_history_frames),
+                    "init_mode": str(self.cfg.get("model", {}).get("init_mode", "unknown")),
+                    "model_id": str(self.cfg.get("model", {}).get("model_id", "unknown")),
+                    "action_dit_pretrained_path": self.cfg.get("model", {}).get(
+                        "action_dit_pretrained_path"
+                    ),
+                    "resume": None if self.cfg.get("resume") is None else str(self.cfg.get("resume")),
+                    "use_text_embed_cache": bool(getattr(self.val_dataset, "use_text_embed_cache", False)),
+                    "contract_hashes": getattr(self.val_dataset, "contract_hashes", {}),
+                    "metrics": metrics,
+                }
+                metadata_path = Path(self.eval_dir) / f"opentouch_eval_step_{self.global_step:06d}.json"
+                metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+            return metrics
+        finally:
+            if was_dit_training:
+                self._set_dit_only_train_mode()
+
+    @torch.no_grad()
+    def _evaluate_lerobot(self):
         if self.val_dataset is None:
             return None
 
@@ -975,43 +1420,21 @@ class Wan22Trainer:
                         metrics = self.evaluate()
                         self.accelerator.wait_for_everyone()
                         if metrics is not None and self.accelerator.is_main_process:
-                            description = "[eval] step=%d val_loss=%.4f infer_psnr=%.4f infer_ssim=%.4f" % (
-                                self.global_step,
-                                metrics["val_loss"],
-                                metrics["psnr_rd"],
-                                metrics["ssim_rd"],
+                            numeric_metrics = {
+                                key: float(value)
+                                for key, value in metrics.items()
+                                if isinstance(value, (int, float, np.integer, np.floating))
+                                and not key.endswith("_count")
+                            }
+                            description = f"[eval] step={self.global_step} " + " ".join(
+                                f"{key}={value:.4f}" for key, value in sorted(numeric_metrics.items())
                             )
-                            if "action_l2" in metrics:
-                                description += " action_l2=%.4f" % metrics["action_l2"]
-                            if "action_l1" in metrics:
-                                description += " action_l1=%.4f" % metrics["action_l1"]
-                            if "joint_force_action_mse" in metrics:
-                                description += " force_action_mse=%.4f force_future_mse=%.4f" % (
-                                    metrics["joint_force_action_mse"], metrics["joint_force_future_mse"]
-                                )
-                                for key, value in metrics.items():
-                                    if key.startswith("force_ablation_"):
-                                        description += f" {key}={value:.4f}"
                             logger.info(description)
                             eval_payload = {
-                                "eval/val_loss": float(metrics["val_loss"]),
-                                "eval/psnr_rg": float(metrics["psnr_rg"]),
-                                "eval/ssim_rg": float(metrics["ssim_rg"]),
-                                "eval/psnr_rd": float(metrics["psnr_rd"]),
-                                "eval/ssim_rd": float(metrics["ssim_rd"]),
-                                "eval/psnr_dg": float(metrics["psnr_dg"]),
-                                "eval/ssim_dg": float(metrics["ssim_dg"]),
+                                f"eval/{key}": float(value)
+                                for key, value in metrics.items()
+                                if isinstance(value, (int, float, np.integer, np.floating))
                             }
-                            if "action_l2" in metrics:
-                                eval_payload["eval/action_l2"] = float(metrics["action_l2"])
-                            if "action_l1" in metrics:
-                                eval_payload["eval/action_l1"] = float(metrics["action_l1"])
-                            if "joint_force_action_mse" in metrics:
-                                eval_payload["eval/joint_force_action_mse"] = metrics["joint_force_action_mse"]
-                                eval_payload["eval/joint_force_future_mse"] = metrics["joint_force_future_mse"]
-                                for key, value in metrics.items():
-                                    if key.startswith("force_ablation_"):
-                                        eval_payload[f"eval/{key}"] = value
                             self._wandb_log(eval_payload)
 
                     if self.save_every > 0 and self.global_step % self.save_every == 0:
