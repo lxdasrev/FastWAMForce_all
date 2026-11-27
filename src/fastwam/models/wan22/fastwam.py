@@ -1,4 +1,5 @@
 import hashlib
+import json
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
@@ -8,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 
+from fastwam.datasets.opentouch.canonical import DATA_VERSION as OPENTOUCH_DATA_VERSION
 from fastwam.utils.logging_config import get_logger
 
 from .action_dit import ActionDiT
@@ -1595,16 +1597,30 @@ class FastWAM(torch.nn.Module):
                             f"inference normalization does not match checkpoint contract: {actual} != {expected}"
                         )
                 normalization = dict(np.load(normalization))
+            required_force_stats = {
+                "force_knee", "force_upper", "force_normalization_max",
+                "force_clip_min", "force_clip_max",
+            }
+            missing_force_stats = required_force_stats.difference(normalization)
+            if missing_force_stats:
+                raise ValueError(
+                    "obsolete OpenTouch force normalization supplied to inference; "
+                    f"missing {sorted(missing_force_stats)}. Rebuild the v2 cache."
+                )
             action_mean = torch.as_tensor(normalization["action_mean"], dtype=torch.float32)
             action_scale = torch.as_tensor(normalization["action_scale"], dtype=torch.float32)
-            force_median = torch.as_tensor(normalization["force_median"], dtype=torch.float32)
-            force_scale = torch.as_tensor(normalization["force_scale"], dtype=torch.float32)
-            asinh_scale = torch.as_tensor(normalization["force_asinh_scale"], dtype=torch.float32)
-            deadzone = torch.as_tensor(normalization["force_deadzone"], dtype=torch.float32)
+            force_knee = torch.as_tensor(normalization["force_knee"], dtype=torch.float32)
+            force_normalization_max = torch.as_tensor(
+                normalization["force_normalization_max"], dtype=torch.float32
+            )
+            force_clip_min = float(np.asarray(normalization["force_clip_min"]))
+            force_clip_max = float(np.asarray(normalization["force_clip_max"]))
             result["action_denormalized"] = action_normalized * action_scale + action_mean
-            compressed = force_normalized * force_scale + force_median
-            result["future_force_denormalized"] = torch.clamp(
-                torch.sinh(compressed) * asinh_scale + deadzone, min=0.0
+            clipped_force = torch.clamp(
+                force_normalized, min=force_clip_min, max=force_clip_max
+            )
+            result["future_force_denormalized"] = (
+                torch.sinh(clipped_force * force_normalization_max) * force_knee
             )
         return result
 
@@ -1683,6 +1699,19 @@ class FastWAM(torch.nn.Module):
                     if strict_contract:
                         raise ValueError(message)
                     logger.warning(message)
+            if self.force_enabled:
+                contract_path = bundle_dir / "data_contract.json"
+                if contract_path.exists():
+                    contract_version = json.loads(contract_path.read_text(encoding="utf-8")).get("version")
+                    if contract_version != OPENTOUCH_DATA_VERSION:
+                        message = (
+                            "Force checkpoint uses an incompatible OpenTouch data contract: "
+                            f"{contract_version!r} != {OPENTOUCH_DATA_VERSION!r}. "
+                            "Rebuild the cache and restart Force warmup; do not resume v1 Force weights."
+                        )
+                        if strict_contract:
+                            raise ValueError(message)
+                        logger.warning(message)
         elif strict_contract and self.force_enabled:
             raise ValueError(
                 "Force checkpoint has no bound data contract. Use it only as an explicit initialization "

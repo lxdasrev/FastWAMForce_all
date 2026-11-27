@@ -13,7 +13,7 @@ import numpy as np
 import torch
 from PIL import Image, ImageOps
 
-from .canonical import normalize_force
+from .canonical import DATA_VERSION, normalize_force
 
 
 class OpenTouchForceDataset(torch.utils.data.Dataset):
@@ -52,6 +52,7 @@ class OpenTouchForceDataset(torch.utils.data.Dataset):
         contract_path = self.cache_dir / "data_contract.json"
         stats_path = self.cache_dir / "normalization.npz"
         hashes_path = self.cache_dir / "contract_hashes.json"
+        quality_path = self.cache_dir / "force_quality_report.json"
         for path in (manifest_path, contract_path, stats_path, hashes_path):
             if not path.exists():
                 raise FileNotFoundError(f"missing OpenTouch cache artifact: {path}")
@@ -65,6 +66,41 @@ class OpenTouchForceDataset(torch.utils.data.Dataset):
         }
         self.normalization_path = stats_path
         self.stats = dict(np.load(stats_path))
+        required_force_stats = {
+            "force_knee", "force_upper", "force_normalization_max",
+            "force_clip_min", "force_clip_max",
+        }
+        missing_force_stats = required_force_stats.difference(self.stats)
+        if missing_force_stats:
+            raise ValueError(
+                "OpenTouch cache uses an obsolete force normalization contract; "
+                f"missing {sorted(missing_force_stats)}. Re-run preprocess_opentouch.py."
+            )
+        contract_version = self.contract.get("version")
+        manifest_version = self.manifest.get("version")
+        if contract_version != DATA_VERSION or manifest_version != DATA_VERSION:
+            raise ValueError(
+                f"OpenTouch cache version mismatch: expected {DATA_VERSION}, "
+                f"contract={contract_version!r}, manifest={manifest_version!r}; "
+                "rebuild the cache and do not resume a v1 Force checkpoint"
+            )
+        if not quality_path.exists():
+            raise FileNotFoundError(f"missing OpenTouch v2 quality artifact: {quality_path}")
+        knee = np.asarray(self.stats["force_knee"], dtype=np.float64)
+        upper = np.asarray(self.stats["force_upper"], dtype=np.float64)
+        normalization_max = np.asarray(self.stats["force_normalization_max"], dtype=np.float64)
+        if knee.shape != (2,) or upper.shape != (2,) or normalization_max.shape != (2,):
+            raise ValueError("force_knee/force_upper/force_normalization_max must each have shape [2]")
+        if not (
+            np.isfinite(knee).all() and np.isfinite(upper).all()
+            and np.isfinite(normalization_max).all() and np.all(knee > 0)
+            and np.all(upper > knee) and np.all(normalization_max > 0)
+        ):
+            raise ValueError("invalid v2 force normalization constants")
+        expected_max = np.arcsinh(upper / knee)
+        if not np.allclose(normalization_max, expected_max, rtol=1e-5, atol=1e-6):
+            raise ValueError("force_normalization_max is inconsistent with force_knee/force_upper")
+        self.force_semantics = str(self.contract.get("force_semantics", "unknown"))
         self.contract_hashes = json.loads(hashes_path.read_text(encoding="utf-8"))
         if strict_contract:
             self._validate_hashes(hashes_path)
@@ -118,15 +154,16 @@ class OpenTouchForceDataset(torch.utils.data.Dataset):
         return action * scale + mean
 
     def denormalize_force(self, force):
-        """Invert robust/asinh normalization to two-finger relative pressure."""
-        median = self._stat_like(self.stats["force_median"], force)
-        scale = self._stat_like(self.stats["force_scale"], force)
-        asinh_scale = self._stat_like(self.stats["force_asinh_scale"], force)
-        deadzone = self._stat_like(self.stats["force_deadzone"], force)
-        compressed = force * scale + median
+        """Return baseline-corrected relative pressure, never raw ADC or Newtons."""
+        knee = self._stat_like(self.stats["force_knee"], force)
+        normalization_max = self._stat_like(self.stats["force_normalization_max"], force)
+        clip_min = float(np.asarray(self.stats["force_clip_min"]))
+        clip_max = float(np.asarray(self.stats["force_clip_max"]))
         if isinstance(force, torch.Tensor):
-            return torch.clamp(torch.sinh(compressed) * asinh_scale + deadzone, min=0.0)
-        return np.maximum(np.sinh(compressed) * asinh_scale + deadzone, 0.0)
+            normalized = torch.clamp(force, min=clip_min, max=clip_max)
+            return torch.sinh(normalized * normalization_max) * knee
+        normalized = np.clip(force, clip_min, clip_max)
+        return np.sinh(normalized * normalization_max) * knee
 
     def _window_group(self, item: dict) -> str:
         record = self.records.get(item["sequence_id"], {})
@@ -141,10 +178,9 @@ class OpenTouchForceDataset(torch.utils.data.Dataset):
         start = current - self.force_history_frames
         stop = current + 33
         with np.load(self.cache_dir / cache_file) as cache:
-            force = np.asarray(cache["force_raw"][start:stop], dtype=np.float32)
+            contact = np.asarray(cache["force_contact"][start:stop], dtype=bool)
             valid = np.asarray(cache["force_valid"][start:stop], dtype=bool)
-        deadzone = np.asarray(self.stats["force_deadzone"], dtype=np.float32)
-        return bool(np.any(valid & (force > deadzone)))
+        return bool(np.any(valid & contact))
 
     def fixed_eval_indices(
         self,
@@ -256,8 +292,9 @@ class OpenTouchForceDataset(torch.utils.data.Dataset):
             pose_valid = bool(cache["pose_valid"][current])
             force_start = current - self.force_history_frames
             force_stop = current + 33
-            force = np.asarray(cache["force_raw"][force_start:force_stop], dtype=np.float32)
+            force = np.asarray(cache["force_clean"][force_start:force_stop], dtype=np.float32)
             force_valid = np.asarray(cache["force_valid"][force_start:force_stop], dtype=bool)
+            force_contact = np.asarray(cache["force_contact"][force_start:force_stop], dtype=bool)
         if len(action) != 32 or len(force) != self.force_observed_frames + 32:
             raise RuntimeError(f"manifest window is incomplete: {item}")
         action = (action - self.stats["action_mean"]) / self.stats["action_scale"]
@@ -267,6 +304,7 @@ class OpenTouchForceDataset(torch.utils.data.Dataset):
             proprio.fill(0)
         force = normalize_force(force, self.stats)
         force[~force_valid] = 0
+        force_contact &= force_valid
         video_indices = current + np.arange(0, 33, 4)
         video = self._decode_video(item, video_indices)
         prompt = item["prompt"]
@@ -278,6 +316,7 @@ class OpenTouchForceDataset(torch.utils.data.Dataset):
             "proprio": torch.from_numpy(proprio),
             "force": torch.from_numpy(force),
             "force_valid": torch.from_numpy(force_valid),
+            "force_contact": torch.from_numpy(force_contact),
             "force_is_pad": torch.zeros_like(torch.from_numpy(force_valid)),
             "force_observed_frames": self.force_observed_frames,
             "prompt": prompt,

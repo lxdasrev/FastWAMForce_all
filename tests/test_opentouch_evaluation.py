@@ -179,7 +179,7 @@ def test_action_only_opentouch_evaluation_never_generates_video(tmp_path):
     assert metrics["generation_action_mse_normalized"] == 0.0
     assert "ACTION canonical" in log
     assert "pred=[1.00000, 1.00000, 1.00000, 1.00000, 1.00000, 1.00000, 1.00000]" in log
-    assert "FORCE relative_pressure" not in log
+    assert "FORCE baseline_corrected_relative_pressure" not in log
 
 
 def test_force_warmup_reports_force_without_action_metric(tmp_path):
@@ -199,7 +199,7 @@ def test_force_warmup_reports_force_without_action_metric(tmp_path):
     assert metrics["generation_force_mse_normalized"] == 0.0
     assert "generation_action_mse_normalized" not in metrics
     assert "ACTION canonical" not in log
-    assert "FORCE relative_pressure" in log
+    assert "FORCE baseline_corrected_relative_pressure" in log
     assert "pred=[2.00000, 2.00000]" in log
 
 
@@ -220,7 +220,7 @@ def test_force_joint_h0_and_h16_use_action_force_path(tmp_path):
         assert metrics["generation_action_mse_normalized"] == 0.0
         assert metrics["generation_force_mse_normalized"] == 0.0
         assert "ACTION canonical" in log
-        assert "FORCE relative_pressure" in log
+        assert "FORCE baseline_corrected_relative_pressure" in log
         assert f"history_frames={history}" in log
         assert f"observed_force_frames={history + 1}" in log
 

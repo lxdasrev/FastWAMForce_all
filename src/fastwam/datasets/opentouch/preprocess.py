@@ -21,15 +21,24 @@ import h5py
 import numpy as np
 
 from .canonical import (
+    DATA_VERSION,
     DEFAULT_TWO_FINGER_TAXELS,
+    calibrate_and_clean_force,
     canonicalize_hand_trajectory,
+    normalize_force,
     pressure_to_two_finger,
 )
 
-DATA_VERSION = "opentouch-fastwam-force-v1"
 FUTURE_FRAMES = 32
 VIDEO_STRIDE = 4
 VIDEO_FRAMES = 9
+MIN_CALIBRATION_FRAMES = 8
+CALIBRATION_FALLBACK_FRACTION = 0.20
+FORCE_MAD_SCALE = 1.4826
+FORCE_NOISE_FLOOR = 5.0
+DEADBAND_LOW_SIGMA = 2.0
+DEADBAND_HIGH_SIGMA = 4.0
+FORCE_UPPER_PERCENTILE = 99.5
 
 
 def _absolute_path(path: Path) -> Path:
@@ -197,12 +206,35 @@ def _safe_stats(values: np.ndarray, valid: np.ndarray, dim: int) -> tuple[np.nda
     return mean.astype(np.float32), np.maximum(std, 1e-6).astype(np.float32)
 
 
+def _fit_force_normalization(force: np.ndarray, valid: np.ndarray) -> dict[str, np.ndarray]:
+    """Fit the v2 positive-pressure transform from training data only."""
+    knee = np.empty(2, dtype=np.float32)
+    upper = np.empty(2, dtype=np.float32)
+    for finger in range(2):
+        positive = force[:, finger][valid[:, finger] & (force[:, finger] > 0)]
+        if positive.size == 0:
+            raise ValueError(f"cannot fit force normalization: no positive training values for finger {finger}")
+        knee[finger] = max(float(np.median(positive)), 1e-6)
+        upper[finger] = max(
+            float(np.percentile(positive, FORCE_UPPER_PERCENTILE)),
+            float(knee[finger]) + 1e-6,
+        )
+    normalization_max = np.arcsinh(upper / knee).astype(np.float32)
+    return {
+        "force_knee": knee,
+        "force_upper": upper,
+        "force_normalization_max": normalization_max,
+        "force_clip_min": np.asarray(0.0, dtype=np.float32),
+        "force_clip_max": np.asarray(1.0, dtype=np.float32),
+    }
+
+
 def convert_records(records: list[DemoRecord], output_dir: Path) -> dict[str, np.ndarray]:
     cache_dir = output_dir / "trajectories"
     cache_dir.mkdir(parents=True, exist_ok=True)
     train_action, train_action_valid = [], []
     train_proprio, train_pose_valid = [], []
-    train_force, train_force_valid, baseline = [], [], []
+    train_force, train_force_valid = [], []
     by_source: dict[str, list[DemoRecord]] = defaultdict(list)
     for record in records:
         by_source[record.source_file].append(record)
@@ -225,6 +257,17 @@ def convert_records(records: list[DemoRecord], output_dir: Path) -> dict[str, np
                 )
                 force_valid &= frame_time_valid[:, None]
                 force_raw[~force_valid] = 0
+                force_clean, force_contact, force_baseline, force_noise = calibrate_and_clean_force(
+                    force_raw,
+                    force_valid,
+                    onset_idx=record.onset_idx,
+                    min_calibration_frames=MIN_CALIBRATION_FRAMES,
+                    fallback_fraction=CALIBRATION_FALLBACK_FRACTION,
+                    mad_scale=FORCE_MAD_SCALE,
+                    noise_floor=FORCE_NOISE_FLOOR,
+                    deadband_low_sigma=DEADBAND_LOW_SIGMA,
+                    deadband_high_sigma=DEADBAND_HIGH_SIGMA,
+                )
                 safe_name = record.sequence_id.replace("::", "__") + ".npz"
                 cache_path = cache_dir / safe_name
                 np.savez_compressed(
@@ -234,7 +277,11 @@ def convert_records(records: list[DemoRecord], output_dir: Path) -> dict[str, np
                     pose_valid=trajectory.pose_valid,
                     action_valid=trajectory.action_valid,
                     force_raw=force_raw,
+                    force_clean=force_clean,
                     force_valid=force_valid,
+                    force_contact=force_contact,
+                    force_baseline=force_baseline,
+                    force_noise=force_noise,
                     timestamps=timestamps,
                     palm_width=np.asarray(trajectory.palm_width, dtype=np.float32),
                     anchor_index=np.asarray(trajectory.anchor_index, dtype=np.int32),
@@ -245,46 +292,25 @@ def convert_records(records: list[DemoRecord], output_dir: Path) -> dict[str, np
                     train_action_valid.append(trajectory.action_valid)
                     train_proprio.append(trajectory.proprio)
                     train_pose_valid.append(trajectory.pose_valid)
-                    train_force.append(force_raw)
+                    train_force.append(force_clean)
                     train_force_valid.append(force_valid)
-                    if record.onset_idx is not None and record.onset_idx > 0:
-                        base_idx = np.arange(min(record.onset_idx, len(force_raw)))
-                    else:
-                        totals = np.where(force_valid, force_raw, 0).sum(-1)
-                        base_idx = np.argsort(totals)[:max(1, int(np.ceil(len(totals) * 0.20)))]
-                    base = force_raw[base_idx]
-                    base_valid = force_valid[base_idx]
-                    baseline.append(np.where(base_valid, base, np.nan))
     actions = np.concatenate(train_action)
     action_valid = np.concatenate(train_action_valid)
     proprios = np.concatenate(train_proprio)
     pose_valid = np.concatenate(train_pose_valid)
     force = np.concatenate(train_force)
     force_valid = np.concatenate(train_force_valid)
-    base = np.concatenate(baseline)
     action_mean, action_scale = _safe_stats(actions, action_valid, 7)
     proprio_mean, proprio_scale = _safe_stats(proprios, pose_valid, 8)
-    deadzone = np.nanpercentile(base, 99, axis=0).astype(np.float32)
-    deadzone = np.nan_to_num(deadzone, nan=0.0)
-    positive = np.where(force_valid, np.maximum(force - deadzone, 0), np.nan)
-    asinh_scale = np.nanmedian(np.where(positive > 0, positive, np.nan), axis=0).astype(np.float32)
-    asinh_scale = np.nan_to_num(asinh_scale, nan=1.0)
-    compressed = np.arcsinh(positive / np.maximum(asinh_scale, 1e-6))
-    force_median = np.nanmedian(compressed, axis=0).astype(np.float32)
-    q05, q95 = np.nanpercentile(compressed, [5, 95], axis=0)
-    force_scale = np.maximum((q95 - q05) * 0.5, 1e-6).astype(np.float32)
-    return {
+    result = {
         "action_mean": action_mean,
         "action_scale": action_scale,
         "proprio_mean": proprio_mean,
         "proprio_scale": proprio_scale,
-        "force_deadzone": deadzone,
-        "force_asinh_scale": asinh_scale,
-        "force_median": force_median,
-        "force_scale": force_scale,
-        "force_clip": np.asarray(5.0, dtype=np.float32),
         "pressure_adc_max": np.asarray(3072.0, dtype=np.float32),
     }
+    result.update(_fit_force_normalization(force, force_valid))
+    return result
 
 
 def build_windows(records: list[DemoRecord], history_frames: int, window_stride: int) -> dict[str, list[dict]]:
@@ -300,11 +326,92 @@ def build_windows(records: list[DemoRecord], history_frames: int, window_stride:
     return windows
 
 
+def build_force_quality_report(
+    records: list[DemoRecord],
+    windows: dict[str, list[dict]],
+    output_dir: Path,
+    stats: dict[str, np.ndarray],
+) -> dict[str, dict]:
+    """Summarize signal preservation without duplicating frames across windows."""
+    record_by_id = {record.sequence_id: record for record in records}
+    report: dict[str, dict] = {}
+    for split in ("train", "val", "test"):
+        valid_count = np.zeros(2, dtype=np.int64)
+        zero_count = np.zeros(2, dtype=np.int64)
+        saturation_count = np.zeros(2, dtype=np.int64)
+        contact_windows = 0
+        constant_contact_windows = 0
+        future_std_sum = np.zeros(2, dtype=np.float64)
+        future_amplitude_sum = np.zeros(2, dtype=np.float64)
+        future_stat_count = np.zeros(2, dtype=np.int64)
+
+        split_records = [record for record in records if record.split == split]
+        for record in split_records:
+            with np.load(output_dir / record.cache_file) as cache:
+                clean = np.asarray(cache["force_clean"], dtype=np.float32)
+                valid = np.asarray(cache["force_valid"], dtype=bool)
+            normalized = normalize_force(clean, stats)
+            valid_count += valid.sum(axis=0)
+            zero_count += (valid & (clean <= 0)).sum(axis=0)
+            saturation_count += (valid & (normalized >= 1.0 - 1e-6)).sum(axis=0)
+
+        windows_by_sequence: dict[str, list[int]] = defaultdict(list)
+        for item in windows[split]:
+            windows_by_sequence[item["sequence_id"]].append(int(item["current_frame"]))
+        for sequence_id, current_frames in windows_by_sequence.items():
+            record = record_by_id[sequence_id]
+            with np.load(output_dir / record.cache_file) as cache:
+                clean = np.asarray(cache["force_clean"], dtype=np.float32)
+                valid = np.asarray(cache["force_valid"], dtype=bool)
+            for current in current_frames:
+                future = clean[current + 1:current + FUTURE_FRAMES + 1]
+                future_valid = valid[current + 1:current + FUTURE_FRAMES + 1]
+                has_contact = bool(np.any(future_valid & (future > 0)))
+                contact_windows += int(has_contact)
+                finger_constant = []
+                for finger in range(2):
+                    values = future[:, finger][future_valid[:, finger]]
+                    if values.size:
+                        amplitude = float(np.ptp(values))
+                        future_std_sum[finger] += float(np.std(values))
+                        future_amplitude_sum[finger] += amplitude
+                        future_stat_count[finger] += 1
+                        finger_constant.append(amplitude <= 1e-6)
+                    else:
+                        finger_constant.append(True)
+                constant_contact_windows += int(has_contact and all(finger_constant))
+
+        window_count = len(windows[split])
+        valid_den = np.maximum(valid_count, 1)
+        stat_den = np.maximum(future_stat_count, 1)
+        saturation_fraction = saturation_count / valid_den
+        constant_contact_fraction = constant_contact_windows / max(contact_windows, 1)
+        report[split] = {
+            "valid_elements_per_finger": valid_count.tolist(),
+            "zero_fraction_per_finger": (zero_count / valid_den).tolist(),
+            "upper_saturation_fraction_per_finger": saturation_fraction.tolist(),
+            "upper_saturation_below_5_percent_per_finger": (saturation_fraction < 0.05).tolist(),
+            "window_count": window_count,
+            "future_contact_window_count": contact_windows,
+            "future_contact_window_fraction": contact_windows / max(window_count, 1),
+            "constant_contact_window_count": constant_contact_windows,
+            "constant_contact_window_fraction": constant_contact_fraction,
+            "constant_contact_window_below_5_percent": constant_contact_fraction < 0.05,
+            "mean_future_std_per_finger": (future_std_sum / stat_den).tolist(),
+            "mean_future_amplitude_per_finger": (future_amplitude_sum / stat_den).tolist(),
+        }
+    return report
+
+
 def write_contract(
     records: list[DemoRecord], windows: dict[str, list[dict]], stats: dict[str, np.ndarray],
-    output_dir: Path, input_dir: Path, history_frames: int, seed: int, hash_sources: bool,
+    quality_report: dict[str, dict], output_dir: Path, input_dir: Path,
+    history_frames: int, seed: int, hash_sources: bool,
 ) -> None:
     np.savez(output_dir / "normalization.npz", **stats)
+    (output_dir / "force_quality_report.json").write_text(
+        json.dumps(quality_report, indent=2), encoding="utf-8"
+    )
     taxel_payload = {key: [list(pair) for pair in value] for key, value in DEFAULT_TWO_FINGER_TAXELS.items()}
     source_files = sorted({record.source_file for record in records})
     source_hashes = {path: _sha256(Path(path)) if hash_sources else None for path in source_files}
@@ -331,7 +438,7 @@ def write_contract(
         "version": DATA_VERSION,
         "processing_git_commit": git_commit,
         "source_root": str(_absolute_path(input_dir)),
-        "force_semantics": "relative_pressure_from_adc_not_newtons",
+        "force_semantics": "baseline_corrected_relative_pressure_from_adc_not_newtons",
         "canonical_frame": "fixed_first_valid_demo_hand_frame",
         "translation_unit": "initial_palm_width",
         "rotation": "so3_log_r_next_r_current_transpose_radians",
@@ -345,7 +452,28 @@ def write_contract(
         "force_future_frames": FUTURE_FRAMES,
         "taxels": taxel_payload,
         "taxel_mask_hash": _json_hash(taxel_payload),
-        "pressure_pipeline": ["3072-raw", "valid_taxel_mean", "per_finger_deadzone", "asinh", "train_robust_normalize", "clip_-5_5"],
+        "pressure_pipeline": [
+            "3072-raw",
+            "valid_taxel_mean",
+            "per_demo_per_finger_baseline_median",
+            "per_demo_per_finger_mad_noise",
+            "smooth_deadband_2sigma_to_4sigma",
+            "train_positive_asinh_knee_median",
+            "train_positive_upper_p99_5",
+            "clip_0_1",
+        ],
+        "force_calibration": {
+            "annotation_onset_min_frames": MIN_CALIBRATION_FRAMES,
+            "fallback": "lowest_20_percent_total_relative_pressure_per_demo",
+            "fallback_fraction": CALIBRATION_FALLBACK_FRACTION,
+            "mad_scale": FORCE_MAD_SCALE,
+            "noise_floor_adc": FORCE_NOISE_FLOOR,
+            "deadband_low_sigma": DEADBAND_LOW_SIGMA,
+            "deadband_high_sigma": DEADBAND_HIGH_SIGMA,
+            "normalization_knee": "train_positive_median_per_finger",
+            "normalization_upper_percentile": FORCE_UPPER_PERCENTILE,
+            "normalization_range": [0.0, 1.0],
+        },
         "retarget": {"gripper_distance_palm_width_range": [0.05, 1.50]},
         "source_files_sha256": source_hashes,
     }
@@ -353,7 +481,10 @@ def write_contract(
     (output_dir / "data_contract.json").write_text(json.dumps(contract, indent=2, ensure_ascii=False), encoding="utf-8")
     hashes = {
         name: _sha256(output_dir / name)
-        for name in ("normalization.npz", "data_contract.json", "split_manifest.json")
+        for name in (
+            "normalization.npz", "data_contract.json", "split_manifest.json",
+            "force_quality_report.json",
+        )
     }
     (output_dir / "contract_hashes.json").write_text(json.dumps(hashes, indent=2), encoding="utf-8")
 
@@ -381,9 +512,14 @@ def main() -> None:
     stratified_group_split(records, args.seed)
     stats = convert_records(records, args.output_dir)
     windows = build_windows(records, args.force_history_frames, args.window_stride)
-    write_contract(records, windows, stats, args.output_dir, args.input_dir,
+    quality_report = build_force_quality_report(records, windows, args.output_dir, stats)
+    write_contract(records, windows, stats, quality_report, args.output_dir, args.input_dir,
                    args.force_history_frames, args.seed, not args.skip_source_hash)
-    print(json.dumps({"demos": len(records), "windows": {k: len(v) for k, v in windows.items()}}, indent=2))
+    print(json.dumps({
+        "demos": len(records),
+        "windows": {key: len(value) for key, value in windows.items()},
+        "force_quality": quality_report,
+    }, indent=2))
 
 
 if __name__ == "__main__":

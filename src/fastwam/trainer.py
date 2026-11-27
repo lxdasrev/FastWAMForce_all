@@ -499,7 +499,10 @@ class Wan22Trainer:
             if force_gt_pressure is None or force_valid is None:
                 raise ValueError("force prediction logging requires GT and validity")
             steps = min(max_steps, force_pred_pressure.shape[0])
-            lines.append("FORCE relative_pressure columns=[thumb,index] unit=relative_pressure_not_newton")
+            lines.append(
+                "FORCE baseline_corrected_relative_pressure columns=[thumb,index] "
+                "unit=relative_pressure_not_newton_not_raw_adc"
+            )
             for step in range(steps):
                 valid = force_valid[step].bool()
                 pred = force_pred_pressure[step]
@@ -968,6 +971,7 @@ class Wan22Trainer:
                 "finetune_video": self.finetune_video,
                 "force_enabled": force_enabled,
                 "force_history_frames": int(getattr(self.val_dataset, "force_history_frames", 0)),
+                "force_semantics": str(getattr(self.val_dataset, "force_semantics", "unknown")),
                 "init_mode": str(self.cfg.get("model", {}).get("init_mode", "unknown")),
                 "model_id": str(self.cfg.get("model", {}).get("model_id", "unknown")),
                 "action_dit_pretrained_path": self.cfg.get("model", {}).get(
@@ -1023,6 +1027,7 @@ class Wan22Trainer:
                     "finetune_video": self.finetune_video,
                     "force_enabled": bool(getattr(model, "force_enabled", False)),
                     "force_history_frames": int(self.val_dataset.force_history_frames),
+                    "force_semantics": str(getattr(self.val_dataset, "force_semantics", "unknown")),
                     "init_mode": str(self.cfg.get("model", {}).get("init_mode", "unknown")),
                     "model_id": str(self.cfg.get("model", {}).get("model_id", "unknown")),
                     "action_dit_pretrained_path": self.cfg.get("model", {}).get(
@@ -1337,7 +1342,10 @@ class Wan22Trainer:
         if cache_dir is None:
             return None
         source_dir = Path(cache_dir)
-        names = ("normalization.npz", "data_contract.json", "split_manifest.json", "contract_hashes.json")
+        names = (
+            "normalization.npz", "data_contract.json", "split_manifest.json",
+            "force_quality_report.json", "contract_hashes.json",
+        )
         hashes = {}
         for name in names:
             source = source_dir / name
@@ -1352,7 +1360,10 @@ class Wan22Trainer:
         cache_dir = getattr(self.train_dataset, "cache_dir", None)
         if cache_dir is None:
             return
-        for name in ("normalization.npz", "data_contract.json", "split_manifest.json"):
+        for name in (
+            "normalization.npz", "data_contract.json", "split_manifest.json",
+            "force_quality_report.json",
+        ):
             saved = checkpoint_dir / name
             current = Path(cache_dir) / name
             if not saved.exists():

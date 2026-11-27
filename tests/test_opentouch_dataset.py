@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from fastwam.datasets.opentouch.canonical import DATA_VERSION
 from fastwam.datasets.opentouch.dataset import OpenTouchForceDataset
 
 
@@ -33,24 +34,31 @@ def test_dataset_33_and_49_contract(tmp_path, history, current, total):
         action=np.zeros((48, 7), np.float32), action_valid=np.ones(48, bool),
         proprio=np.zeros((49, 8), np.float32), pose_valid=np.ones(49, bool),
         force_raw=np.ones((49, 2), np.float32), force_valid=np.ones((49, 2), bool),
+        force_clean=np.ones((49, 2), np.float32), force_contact=np.ones((49, 2), bool),
+        force_baseline=np.zeros(2, np.float32), force_noise=np.full(2, 5, np.float32),
     )
     window = {
         "sequence_id": "source::demo_000", "source_file": str(source), "demo_key": "demo_000",
         "cache_file": "trajectories/demo.npz", "current_frame": current, "prompt": "Use the gripper.",
     }
-    manifest = {"windows": {"train": [window], "val": [window], "test": []}}
-    contract = {"force_history_frames": history}
+    manifest = {"version": DATA_VERSION, "windows": {"train": [window], "val": [window], "test": []}}
+    contract = {"version": DATA_VERSION, "force_history_frames": history}
     (tmp_path / "split_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     (tmp_path / "data_contract.json").write_text(json.dumps(contract), encoding="utf-8")
     np.savez(
         tmp_path / "normalization.npz",
         action_mean=np.zeros(7), action_scale=np.ones(7),
         proprio_mean=np.zeros(8), proprio_scale=np.ones(8),
-        force_deadzone=np.zeros(2), force_asinh_scale=np.ones(2),
-        force_median=np.zeros(2), force_scale=np.ones(2), force_clip=np.asarray(5.0),
+        force_knee=np.ones(2), force_upper=np.full(2, 3.0),
+        force_normalization_max=np.full(2, np.arcsinh(3.0)),
+        force_clip_min=np.asarray(0.0), force_clip_max=np.asarray(1.0),
     )
+    (tmp_path / "force_quality_report.json").write_text("{}", encoding="utf-8")
     hashes = {}
-    for name in ("split_manifest.json", "data_contract.json", "normalization.npz"):
+    for name in (
+        "split_manifest.json", "data_contract.json", "normalization.npz",
+        "force_quality_report.json",
+    ):
         hashes[name] = hashlib.sha256((tmp_path / name).read_bytes()).hexdigest()
     (tmp_path / "contract_hashes.json").write_text(json.dumps(hashes), encoding="utf-8")
 
@@ -62,10 +70,16 @@ def test_dataset_33_and_49_contract(tmp_path, history, current, total):
     assert sample["action_chunk"].shape == (32, 7)
     assert sample["proprio"].shape == (8,)
     assert sample["force"].shape == (total, 2)
+    assert sample["force_contact"].shape == (total, 2)
+    assert sample["force_contact"].all()
     assert sample["force_observed_frames"] == history + 1
     assert sample["split_group"] == "source::demo_000"
     action = np.ones((2, 7), dtype=np.float32)
     force = np.ones((2, 2), dtype=np.float32)
     assert np.allclose(dataset.denormalize_action(action), action)
-    assert np.all(dataset.denormalize_force(force) > 0)
+    assert np.allclose(dataset.denormalize_force(force), 3.0)
+    assert np.allclose(
+        dataset.denormalize_force(np.array([[-1.0, 2.0]], dtype=np.float32)),
+        [[0.0, 3.0]],
+    )
     assert dataset.fixed_eval_indices(1, contact_only=True, unique_groups=True) == [0]

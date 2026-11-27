@@ -14,6 +14,7 @@ import numpy as np
 
 ACTION_DIM = 7
 PROPRIO_DIM = 8
+DATA_VERSION = "opentouch-fastwam-force-v2"
 WRIST, THUMB_TIP, INDEX_MCP, INDEX_TIP, MIDDLE_MCP, PINKY_MCP = 0, 4, 5, 8, 9, 17
 
 # Copied from OpenTouch five-finger/assets/fingertip_taxels.json.  Coordinates
@@ -201,15 +202,79 @@ def pressure_to_two_finger(
     return np.stack(force, axis=-1).astype(np.float32), np.stack(valid, axis=-1)
 
 
-def normalize_force(force: np.ndarray, stats: Mapping[str, np.ndarray | float]) -> np.ndarray:
-    """Apply the contract-defined force preprocessing in its fixed order."""
+def calibrate_and_clean_force(
+    force: np.ndarray,
+    valid: np.ndarray,
+    *,
+    onset_idx: int | None = None,
+    min_calibration_frames: int = 8,
+    fallback_fraction: float = 0.20,
+    mad_scale: float = 1.4826,
+    noise_floor: float = 5.0,
+    deadband_low_sigma: float = 2.0,
+    deadband_high_sigma: float = 4.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Remove per-demo sensor offset/noise with a smooth ME-Dex-style deadband.
+
+    The returned pressure is baseline-corrected relative ADC magnitude, not a
+    physical force in Newtons.  Calibration is independent per finger so one
+    invalid finger does not invalidate the other.
+    """
     x = np.asarray(force, dtype=np.float32)
-    deadzone = np.asarray(stats["force_deadzone"], dtype=np.float32)
-    asinh_scale = np.asarray(stats["force_asinh_scale"], dtype=np.float32)
-    median = np.asarray(stats["force_median"], dtype=np.float32)
-    scale = np.asarray(stats["force_scale"], dtype=np.float32)
-    clip = float(np.asarray(stats.get("force_clip", 5.0)))
-    x = np.maximum(x - deadzone, 0)
-    x = np.arcsinh(x / np.maximum(asinh_scale, 1e-6))
-    x = (x - median) / np.maximum(scale, 1e-6)
-    return np.clip(x, -clip, clip).astype(np.float32)
+    is_valid = np.asarray(valid, dtype=bool)
+    if x.ndim != 2 or x.shape[-1] != 2 or is_valid.shape != x.shape:
+        raise ValueError(f"force and valid must have identical [T,2] shapes, got {x.shape} and {is_valid.shape}")
+    if min_calibration_frames < 1:
+        raise ValueError("min_calibration_frames must be positive")
+    if not 0 < fallback_fraction <= 1:
+        raise ValueError("fallback_fraction must be in (0,1]")
+    if not 0 <= deadband_low_sigma < deadband_high_sigma:
+        raise ValueError("deadband sigma bounds must satisfy 0 <= low < high")
+
+    safe = np.where(is_valid, x, 0.0)
+    totals = safe.sum(axis=-1)
+    baseline = np.zeros(2, dtype=np.float32)
+    noise = np.full(2, float(noise_floor), dtype=np.float32)
+    annotated_stop = min(max(int(onset_idx or 0), 0), len(x))
+
+    for finger in range(2):
+        annotated = np.flatnonzero(is_valid[:annotated_stop, finger])
+        if annotated.size >= min_calibration_frames:
+            calibration = annotated
+        else:
+            candidates = np.flatnonzero(is_valid[:, finger])
+            if candidates.size == 0:
+                continue
+            count = min(
+                candidates.size,
+                max(min_calibration_frames, int(np.ceil(candidates.size * fallback_fraction))),
+            )
+            order = np.argsort(totals[candidates], kind="stable")
+            calibration = candidates[order[:count]]
+        values = x[calibration, finger]
+        center = float(np.median(values))
+        mad = float(np.median(np.abs(values - center)))
+        baseline[finger] = center
+        noise[finger] = max(float(mad_scale) * mad, float(noise_floor))
+
+    residual = np.maximum(x - baseline, 0.0)
+    low = deadband_low_sigma * noise
+    width = (deadband_high_sigma - deadband_low_sigma) * noise
+    unit = np.clip((residual - low) / np.maximum(width, 1e-6), 0.0, 1.0)
+    smoothstep = unit * unit * (3.0 - 2.0 * unit)
+    clean = (residual * smoothstep).astype(np.float32)
+    clean[~is_valid] = 0.0
+    contact = is_valid & (clean > 0.0)
+    return clean, contact, baseline, noise
+
+
+def normalize_force(force: np.ndarray, stats: Mapping[str, np.ndarray | float]) -> np.ndarray:
+    """Normalize baseline-corrected relative pressure to the v2 [0,1] contract."""
+    x = np.asarray(force, dtype=np.float32)
+    knee = np.asarray(stats["force_knee"], dtype=np.float32)
+    normalization_max = np.asarray(stats["force_normalization_max"], dtype=np.float32)
+    clip_min = float(np.asarray(stats.get("force_clip_min", 0.0)))
+    clip_max = float(np.asarray(stats.get("force_clip_max", 1.0)))
+    x = np.arcsinh(np.maximum(x, 0.0) / np.maximum(knee, 1e-6))
+    x = x / np.maximum(normalization_max, 1e-6)
+    return np.clip(x, clip_min, clip_max).astype(np.float32)

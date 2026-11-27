@@ -26,10 +26,19 @@ quick local smoke cache and should not be used for reported experiments.
 
 The output contract contains:
 
-- `normalization.npz`: action/proprio mean-scale and force robust statistics;
+- `normalization.npz`: action/proprio mean-scale plus train-only positive-force
+  `knee`, `upper` and asinh normalization constants;
 - `data_contract.json`: coordinate, unit, timing, taxel and dimension semantics;
 - `split_manifest.json`: sequence groups and every legal training window;
+- `force_quality_report.json`: per-split zero, saturation, contact and temporal
+  variation diagnostics;
 - `contract_hashes.json`: strict hashes used by resume and inference.
+
+Force cache version v2 estimates a median baseline and MAD noise independently
+for each demo/finger, applies a smooth 2-sigma to 4-sigma deadband, then maps
+baseline-corrected relative pressure to `[0,1]` with train-only statistics. Old
+v1 caches and Force checkpoints are intentionally rejected; rebuild the cache
+and restart Force warmup. Wan/ActionDiT initialization remains reusable.
 
 Generate the prompt embeddings after the cache exists:
 
@@ -73,7 +82,7 @@ trainable DiT experts but still loads and freezes the pretrained VAE/text
 encoder. A legacy FastWAM checkpoint is an initialization source, never a
 strict Force resume.
 
-Each saved weight bundle is a directory containing `model.pt` and all four data
+Each saved weight bundle is a directory containing `model.pt` and all five data
 contract files. Contract mismatch is an error by default. Training logs include
 raw, scheduler-weighted and final force losses, valid ratios/sample counts, and
 flow `x0_hat` prediction-versus-truth summaries. Every configured joint eval
@@ -102,7 +111,8 @@ force modes are inferred from the cache contract.
 By default each generation evaluation also logs the first fixed sample's full
 32-step prediction/target comparison. Actions are printed in denormalized
 canonical coordinates (`dx,dy,dz,drx,dry,drz,gripper_target`), and force is
-printed as two-finger relative pressure rather than Newtons. Invalid or padded
+printed as baseline-corrected two-finger relative pressure rather than Newtons
+or raw ADC. Invalid or padded
 elements are shown as `NA`. Control this with `evaluation.print_predictions`,
 `print_prediction_samples`, `print_prediction_steps`, and
 `print_prediction_precision`. Only rank zero prints, warmup prints force only,
