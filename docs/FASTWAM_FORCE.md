@@ -108,8 +108,12 @@ without treating its untrained action as an effect metric. A model configured wi
 `infer_action` as the action-only baseline. Both 1-frame and 17-frame observed
 force modes are inferred from the cache contract.
 
-By default each generation evaluation also logs the first fixed sample's full
-32-step prediction/target comparison. Actions are printed in denormalized
+By default each generation evaluation also logs one sample's full
+32-step prediction/target comparison. With `print_prediction_selection=contact_random`,
+the formal fixed evaluation set remains unchanged while the console preview is
+chosen reproducibly from rank zero's candidates whose valid future Force has at
+least 25% contact; if none qualifies, the most contact-rich sample is shown.
+Actions are printed in denormalized
 canonical coordinates (`dx,dy,dz,drx,dry,drz,gripper_target`), and force is
 printed as baseline-corrected two-finger relative pressure rather than Newtons
 or raw ADC. Invalid or padded
@@ -118,6 +122,12 @@ elements are shown as `NA`. Control this with `evaluation.print_predictions`,
 `print_prediction_precision`. Only rank zero prints, warmup prints force only,
 and action-only baselines print action only; ablation tensors remain in NPZ
 files instead of being expanded into the console log.
+
+At each `log_every` step, `training.print_bridge_diagnostics=true` prints all
+seven H-Bridge raw/tanh gates, clipped gradients, residual RMS and
+`abs(tanh_gate) * residual_rms` effective RMS. Warmup reports frozen zero gates;
+joint training reports trainable gates. The same values remain available in
+W&B under `bridge/<force_layer>/...`.
 
 Run a strict checkpoint-bound offline evaluation with one non-overlapping
 contact window per validation sequence group:

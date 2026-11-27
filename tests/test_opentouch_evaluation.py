@@ -1,4 +1,5 @@
 from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -118,7 +119,7 @@ class _FakeDataset:
         }
 
 
-def _cfg(stage, *, print_predictions=True, print_steps=32):
+def _cfg(stage, *, print_predictions=True, print_steps=32, selection="contact_random"):
     return OmegaConf.create({
         "seed": 42,
         "eval_num_inference_steps": 2,
@@ -131,6 +132,8 @@ def _cfg(stage, *, print_predictions=True, print_steps=32):
             "print_prediction_samples": 1,
             "print_prediction_steps": print_steps,
             "print_prediction_precision": 5,
+            "print_prediction_selection": selection,
+            "print_prediction_min_force_nonzero_ratio": 0.25,
         },
     })
 
@@ -178,6 +181,9 @@ def test_action_only_opentouch_evaluation_never_generates_video(tmp_path):
     assert model.force_calls == 0
     assert metrics["generation_action_mse_normalized"] == 0.0
     assert "ACTION canonical" in log
+    assert "selection=contact_random" in log
+    assert "future_force_nonzero_ratio=0.0000" in log
+    assert "candidate_count=1 eligible_count=0" in log
     assert "pred=[1.00000, 1.00000, 1.00000, 1.00000, 1.00000, 1.00000, 1.00000]" in log
     assert "FORCE baseline_corrected_relative_pressure" not in log
 
@@ -257,3 +263,130 @@ def test_prediction_log_can_be_disabled_and_only_main_process_prints(tmp_path):
         with patch("fastwam.trainer.logger.info") as info:
             runner.evaluate()
         assert "[opentouch-prediction]" not in _prediction_log(info)
+
+
+def test_contact_random_preview_is_reproducible_and_filters_low_contact():
+    runner = Wan22Trainer.__new__(Wan22Trainer)
+    runner.seed = 42
+    runner.global_step = 2000
+    runner.print_prediction_samples = 2
+    runner.print_prediction_selection = "contact_random"
+    runner.print_prediction_min_force_nonzero_ratio = 0.25
+    candidates = [
+        {"name": "mostly_zero", "nonzero_ratio": 0.05},
+        {"name": "contact_a", "nonzero_ratio": 0.50},
+        {"name": "contact_b", "nonzero_ratio": 0.75},
+        {"name": "contact_c", "nonzero_ratio": 0.30},
+    ]
+    selected_a, eligible_a = runner._select_prediction_previews(candidates)
+    selected_b, eligible_b = runner._select_prediction_previews(candidates)
+    assert eligible_a == eligible_b == 3
+    assert [item["name"] for item in selected_a] == [item["name"] for item in selected_b]
+    assert all(item["nonzero_ratio"] >= 0.25 for item in selected_a)
+
+
+def test_contact_random_falls_back_to_highest_contact():
+    runner = Wan22Trainer.__new__(Wan22Trainer)
+    runner.seed = 42
+    runner.global_step = 2000
+    runner.print_prediction_samples = 1
+    runner.print_prediction_selection = "contact_random"
+    runner.print_prediction_min_force_nonzero_ratio = 0.90
+    selected, eligible = runner._select_prediction_previews([
+        {"name": "low", "nonzero_ratio": 0.05},
+        {"name": "best", "nonzero_ratio": 0.40},
+        {"name": "middle", "nonzero_ratio": 0.20},
+    ])
+    assert eligible == 0
+    assert selected[0]["name"] == "best"
+
+
+def test_fixed_max_contact_and_random_preview_modes():
+    runner = Wan22Trainer.__new__(Wan22Trainer)
+    runner.seed = 9
+    runner.global_step = 2000
+    runner.print_prediction_samples = 1
+    runner.print_prediction_min_force_nonzero_ratio = 0.25
+    candidates = [
+        {"name": "first", "nonzero_ratio": 0.10},
+        {"name": "best", "nonzero_ratio": 0.80},
+        {"name": "other", "nonzero_ratio": 0.40},
+    ]
+    runner.print_prediction_selection = "fixed"
+    assert runner._select_prediction_previews(candidates)[0][0]["name"] == "first"
+    runner.print_prediction_selection = "max_contact"
+    assert runner._select_prediction_previews(candidates)[0][0]["name"] == "best"
+    runner.print_prediction_selection = "random"
+    first = runner._select_prediction_previews(candidates)[0][0]["name"]
+    second = runner._select_prediction_previews(candidates)[0][0]["name"]
+    assert first == second
+
+
+def test_future_force_nonzero_ratio_uses_contact_validity_and_padding():
+    force = torch.zeros(1, 5, 2)
+    valid = torch.ones(1, 5, 2, dtype=torch.bool)
+    is_pad = torch.zeros(1, 5, 2, dtype=torch.bool)
+    contact = torch.zeros(1, 5, 2, dtype=torch.bool)
+    contact[0, 1, 0] = True
+    contact[0, 2, 0] = True
+    contact[0, 3, 1] = True
+    valid[0, 2, 0] = False
+    is_pad[0, 4, 1] = True
+    sample = {
+        "force": force,
+        "force_valid": valid,
+        "force_is_pad": is_pad,
+        "force_contact": contact,
+        "force_observed_frames": 1,
+    }
+    # Six valid future elements remain; two valid contact elements count.
+    assert np.isclose(Wan22Trainer._future_force_nonzero_ratio(sample), 2.0 / 6.0)
+
+
+def test_bridge_diagnostics_are_aggregated_and_printed():
+    gate = torch.nn.Parameter(torch.tensor(0.2))
+    gate.grad = torch.tensor(0.03)
+
+    class _DiagnosticDit:
+        force_to_backbone = {1: 8}
+        bridge_gates = torch.nn.ParameterDict({"1": gate})
+
+        def bridge_diagnostics(self):
+            return {
+                1: {
+                    "raw": gate.detach(),
+                    "tanh": torch.tanh(gate.detach()),
+                    "grad": gate.grad.detach(),
+                    "residual_rms": torch.tensor(2.0),
+                }
+            }
+
+    runner = Wan22Trainer.__new__(Wan22Trainer)
+    runner.accelerator = _FakeAccelerator()
+    runner.print_bridge_diagnostics = True
+    runner.global_step = 100
+    runner.training_stage = "joint"
+    snapshot = runner._collect_bridge_diagnostics(SimpleNamespace(dit=_DiagnosticDit()))
+    assert np.isclose(snapshot[1]["effective_rms"], abs(np.tanh(0.2)) * 2.0)
+    assert snapshot[1]["trainable"]
+    with patch("fastwam.trainer.logger.info") as info:
+        runner._log_bridge_diagnostic_snapshot(snapshot)
+    log = _prediction_log(info)
+    assert "[bridge-gate] step=100 stage=joint F1->VA8 trainable=1" in log
+    assert "grad_after_clip=" in log
+    assert "residual_rms=" in log
+    assert "effective_rms=" in log
+
+    runner.print_bridge_diagnostics = False
+    with patch("fastwam.trainer.logger.info") as info:
+        runner._log_bridge_diagnostic_snapshot(snapshot)
+    info.assert_not_called()
+
+    gate.grad = None
+    gate.data.zero_()
+    gate.requires_grad_(False)
+    runner.training_stage = "force_warmup"
+    warmup = runner._collect_bridge_diagnostics(SimpleNamespace(dit=_DiagnosticDit()))
+    assert not warmup[1]["trainable"]
+    assert warmup[1]["raw"] == 0.0
+    assert warmup[1]["grad"] == 0.0

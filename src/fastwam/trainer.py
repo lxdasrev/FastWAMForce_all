@@ -48,6 +48,7 @@ class Wan22Trainer:
         evaluation_cfg = cfg.get("evaluation", {})
         instance.training_stage = str(training_cfg.get("stage", "joint")).strip().lower()
         instance.finetune_video = bool(training_cfg.get("finetune_video", True))
+        instance.print_bridge_diagnostics = False
         instance.joint_eval_every = 1
         instance.tactile_ablation_every = 1
         configured_loss = int(evaluation_cfg.get("offline_loss_samples", 0))
@@ -96,6 +97,7 @@ class Wan22Trainer:
         training_cfg = cfg.get("training", {})
         self.training_stage = str(training_cfg.get("stage", "joint")).strip().lower()
         self.finetune_video = bool(training_cfg.get("finetune_video", True))
+        self.print_bridge_diagnostics = bool(training_cfg.get("print_bridge_diagnostics", False))
         self.joint_eval_every = int(training_cfg.get("joint_eval_every", 2000))
         self.tactile_ablation_every = int(training_cfg.get("tactile_ablation_every", 2000))
         evaluation_cfg = cfg.get("evaluation", {})
@@ -418,12 +420,28 @@ class Wan22Trainer:
         self.print_prediction_samples = int(evaluation_cfg.get("print_prediction_samples", 1))
         self.print_prediction_steps = int(evaluation_cfg.get("print_prediction_steps", 32))
         self.print_prediction_precision = int(evaluation_cfg.get("print_prediction_precision", 5))
+        self.print_prediction_selection = str(
+            evaluation_cfg.get("print_prediction_selection", "contact_random")
+        ).strip().lower()
+        self.print_prediction_min_force_nonzero_ratio = float(
+            evaluation_cfg.get("print_prediction_min_force_nonzero_ratio", 0.25)
+        )
         if self.print_prediction_samples < 0:
             raise ValueError("evaluation.print_prediction_samples must be non-negative")
         if not 0 <= self.print_prediction_steps <= 32:
             raise ValueError("evaluation.print_prediction_steps must be between 0 and 32")
         if not 0 <= self.print_prediction_precision <= 10:
             raise ValueError("evaluation.print_prediction_precision must be between 0 and 10")
+        allowed_selection = {"contact_random", "fixed", "max_contact", "random"}
+        if self.print_prediction_selection not in allowed_selection:
+            raise ValueError(
+                "evaluation.print_prediction_selection must be one of "
+                f"{sorted(allowed_selection)}, got {self.print_prediction_selection!r}"
+            )
+        if not 0.0 <= self.print_prediction_min_force_nonzero_ratio <= 1.0:
+            raise ValueError(
+                "evaluation.print_prediction_min_force_nonzero_ratio must be between 0 and 1"
+            )
 
     def _format_eval_vector(self, values: torch.Tensor, valid: torch.Tensor | bool) -> str:
         values = values.detach().float().cpu().reshape(-1)
@@ -448,6 +466,111 @@ class Wan22Trainer:
                 formatted.append(str(value))
         return "[" + ", ".join(formatted) + "]"
 
+    @staticmethod
+    def _future_force_nonzero_ratio(sample: dict) -> float:
+        force = sample.get("force")
+        if force is None:
+            return 0.0
+        observed = int(sample.get("force_observed_frames") or 1)
+        effective = (
+            sample["force_valid"][0, observed:].bool().cpu()
+            & ~sample["force_is_pad"][0, observed:].bool().cpu()
+        )
+        if not bool(effective.any()):
+            return 0.0
+        contact = sample.get("force_contact")
+        if contact is None:
+            contact = sample["force"][0, observed:].detach().float().cpu() > 0
+        else:
+            contact = contact[0, observed:].bool().cpu()
+        return float((contact & effective).sum().item() / effective.sum().item())
+
+    def _select_prediction_previews(self, candidates: list[dict]) -> tuple[list[dict], int]:
+        if not candidates or self.print_prediction_samples <= 0:
+            return [], 0
+        count = min(self.print_prediction_samples, len(candidates))
+        threshold = self.print_prediction_min_force_nonzero_ratio
+        eligible = [candidate for candidate in candidates if candidate["nonzero_ratio"] >= threshold]
+        mode = self.print_prediction_selection
+        if mode == "fixed":
+            return candidates[:count], len(eligible)
+        if mode == "max_contact":
+            ranked = sorted(candidates, key=lambda item: item["nonzero_ratio"], reverse=True)
+            return ranked[:count], len(eligible)
+
+        rng = np.random.default_rng(self.seed + self.global_step)
+        if mode == "random":
+            pool = list(candidates)
+        else:
+            pool = list(eligible)
+            if len(pool) < count:
+                selected_ids = {id(candidate) for candidate in pool}
+                remainder = sorted(
+                    (candidate for candidate in candidates if id(candidate) not in selected_ids),
+                    key=lambda item: item["nonzero_ratio"],
+                    reverse=True,
+                )
+                pool.extend(remainder[:count - len(pool)])
+        if not pool:
+            pool = sorted(candidates, key=lambda item: item["nonzero_ratio"], reverse=True)[:count]
+        chosen = rng.choice(len(pool), size=min(count, len(pool)), replace=False)
+        return [pool[int(index)] for index in np.atleast_1d(chosen)], len(eligible)
+
+    def _collect_bridge_diagnostics(self, model) -> dict[int, dict] | None:
+        dit = getattr(model, "dit", None)
+        diagnostics_fn = getattr(dit, "bridge_diagnostics", None)
+        if diagnostics_fn is None:
+            return None
+        diagnostics = diagnostics_fn()
+        if not diagnostics:
+            return None
+        bridge_ids = sorted(int(bridge) for bridge in diagnostics)
+        local_values = []
+        for bridge in bridge_ids:
+            values = diagnostics[bridge]
+            local_values.append([
+                float(values["raw"].float().item()),
+                float(values["tanh"].float().item()),
+                0.0 if values["grad"] is None else float(values["grad"].float().item()),
+                0.0 if values["residual_rms"] is None else float(values["residual_rms"].float().item()),
+            ])
+        local = torch.tensor(local_values, device=self.accelerator.device, dtype=torch.float64)
+        gathered = self.accelerator.gather(local).reshape(-1, len(bridge_ids), 4).mean(dim=0).cpu()
+        mapping = getattr(dit, "force_to_backbone", {})
+        gates = getattr(dit, "bridge_gates", {})
+        snapshot = {}
+        for row, bridge in zip(gathered, bridge_ids):
+            raw, tanh, grad, residual_rms = (float(value) for value in row.tolist())
+            snapshot[bridge] = {
+                "raw": raw,
+                "tanh": tanh,
+                "grad": grad,
+                "residual_rms": residual_rms,
+                "effective_rms": abs(tanh) * residual_rms,
+                "backbone_layer": int(mapping.get(bridge, -1)),
+                "trainable": bool(gates[str(bridge)].requires_grad) if str(bridge) in gates else False,
+            }
+        return snapshot
+
+    def _log_bridge_diagnostic_snapshot(self, snapshot: dict[int, dict] | None) -> None:
+        if (
+            not self.print_bridge_diagnostics
+            or not self.accelerator.is_main_process
+            or not snapshot
+        ):
+            return
+        lines = []
+        for bridge, values in sorted(snapshot.items()):
+            lines.append(
+                f"[bridge-gate] step={self.global_step} stage={self.training_stage} "
+                f"F{bridge}->VA{values['backbone_layer']} trainable={int(values['trainable'])} "
+                f"raw={values['raw']:.6e} tanh={values['tanh']:.6e} "
+                f"grad_after_clip={values['grad']:.6e} "
+                f"residual_rms={values['residual_rms']:.6e} "
+                f"effective_rms={values['effective_rms']:.6e}"
+            )
+        logger.info("%s", "\n".join(lines))
+
     def _log_opentouch_prediction_preview(
         self,
         *,
@@ -459,6 +582,9 @@ class Wan22Trainer:
         force_pred_pressure: torch.Tensor | None,
         force_gt_pressure: torch.Tensor | None,
         force_valid: torch.Tensor | None,
+        nonzero_ratio: float,
+        candidate_count: int,
+        eligible_count: int,
     ) -> None:
         if (
             not self.print_eval_predictions
@@ -474,7 +600,10 @@ class Wan22Trainer:
             f"global_step={self.global_step} sample={sample_number + 1} "
             f"sequence_id={sample['sequence_id']} current_frame={int(sample['current_frame'])} "
             f"split_group={sample['split_group']} stage={self.training_stage} "
-            f"history_frames={history_frames} observed_force_frames={observed}"
+            f"history_frames={history_frames} observed_force_frames={observed} "
+            f"selection={self.print_prediction_selection} "
+            f"future_force_nonzero_ratio={nonzero_ratio:.4f} "
+            f"candidate_count={candidate_count} eligible_count={eligible_count}"
         ]
         max_steps = self.print_prediction_steps
         if action_pred_canonical is not None:
@@ -529,6 +658,7 @@ class Wan22Trainer:
         force = sample.get("force", None)
         force_valid = sample.get("force_valid", None)
         force_is_pad = sample.get("force_is_pad", None)
+        force_contact = sample.get("force_contact", None)
         force_observed_frames = sample.get("force_observed_frames", None)
 
         if not isinstance(video, torch.Tensor):
@@ -592,8 +722,12 @@ class Wan22Trainer:
                 force_valid = force_valid.unsqueeze(0)
             if force_is_pad.ndim == 2:
                 force_is_pad = force_is_pad.unsqueeze(0)
+            if force_contact is not None and force_contact.ndim == 2:
+                force_contact = force_contact.unsqueeze(0)
             if force.ndim != 3 or force_valid.shape != force.shape or force_is_pad.shape != force.shape:
                 raise ValueError("force/force_valid/force_is_pad must batch to identical [B,T,2] shapes")
+            if force_contact is not None and force_contact.shape != force.shape:
+                raise ValueError("force_contact must match force [B,T,2]")
             if isinstance(force_observed_frames, torch.Tensor):
                 force_observed_frames = int(force_observed_frames.item())
 
@@ -621,6 +755,7 @@ class Wan22Trainer:
             "force": force,
             "force_valid": force_valid,
             "force_is_pad": force_is_pad,
+            "force_contact": force_contact,
             "force_observed_frames": force_observed_frames,
             "sequence_id": sample.get("sequence_id"),
             "current_frame": sample.get("current_frame"),
@@ -771,6 +906,7 @@ class Wan22Trainer:
             "action_pred_canonical": [], "action_gt_canonical": [],
         }
         sample_mse: dict[str, list[float]] = {}
+        preview_candidates: list[dict] = []
         force_enabled = bool(getattr(model, "force_enabled", False))
         metric_prefixes = ["generation_"] if report_action else []
         if run_ablation and force_enabled:
@@ -836,16 +972,22 @@ class Wan22Trainer:
             saved["action_gt_canonical"].append(action_gt_canonical.numpy())
 
             if not force_enabled:
-                self._log_opentouch_prediction_preview(
-                    sample=sample,
-                    sample_number=local_position,
-                    action_pred_canonical=action_pred_canonical if report_action else None,
-                    action_gt_canonical=action_gt_canonical if report_action else None,
-                    action_valid=action_valid if report_action else None,
-                    force_pred_pressure=None,
-                    force_gt_pressure=None,
-                    force_valid=None,
-                )
+                if self.accelerator.is_main_process and self.print_eval_predictions:
+                    preview_candidates.append({
+                        "sample": {
+                            "sequence_id": sample["sequence_id"],
+                            "current_frame": sample["current_frame"],
+                            "split_group": sample["split_group"],
+                            "force_observed_frames": sample["force_observed_frames"],
+                        },
+                        "nonzero_ratio": self._future_force_nonzero_ratio(sample),
+                        "action_pred_canonical": action_pred_canonical if report_action else None,
+                        "action_gt_canonical": action_gt_canonical if report_action else None,
+                        "action_valid": action_valid if report_action else None,
+                        "force_pred_pressure": None,
+                        "force_gt_pressure": None,
+                        "force_valid": None,
+                    })
                 continue
             observed = int(sample["force_observed_frames"])
             future_gt = sample["force"][0, observed:].float().cpu()
@@ -884,16 +1026,22 @@ class Wan22Trainer:
                 ).numpy()
             )
 
-            self._log_opentouch_prediction_preview(
-                sample=sample,
-                sample_number=local_position,
-                action_pred_canonical=action_pred_canonical if report_action else None,
-                action_gt_canonical=action_gt_canonical if report_action else None,
-                action_valid=action_valid if report_action else None,
-                force_pred_pressure=force_pred_pressure,
-                force_gt_pressure=force_gt_pressure,
-                force_valid=effective_future,
-            )
+            if self.accelerator.is_main_process and self.print_eval_predictions:
+                preview_candidates.append({
+                    "sample": {
+                        "sequence_id": sample["sequence_id"],
+                        "current_frame": sample["current_frame"],
+                        "split_group": sample["split_group"],
+                        "force_observed_frames": sample["force_observed_frames"],
+                    },
+                    "nonzero_ratio": self._future_force_nonzero_ratio(sample),
+                    "action_pred_canonical": action_pred_canonical if report_action else None,
+                    "action_gt_canonical": action_gt_canonical if report_action else None,
+                    "action_valid": action_valid if report_action else None,
+                    "force_pred_pressure": force_pred_pressure,
+                    "force_gt_pressure": force_gt_pressure,
+                    "force_valid": effective_future,
+                })
 
             if not run_ablation:
                 continue
@@ -946,6 +1094,22 @@ class Wan22Trainer:
                     self.val_dataset.denormalize_action(variant_action).numpy()
                 )
 
+        selected_previews, eligible_count = self._select_prediction_previews(preview_candidates)
+        for preview_number, preview in enumerate(selected_previews):
+            self._log_opentouch_prediction_preview(
+                sample=preview["sample"],
+                sample_number=preview_number,
+                action_pred_canonical=preview["action_pred_canonical"],
+                action_gt_canonical=preview["action_gt_canonical"],
+                action_valid=preview["action_valid"],
+                force_pred_pressure=preview["force_pred_pressure"],
+                force_gt_pressure=preview["force_gt_pressure"],
+                force_valid=preview["force_valid"],
+                nonzero_ratio=preview["nonzero_ratio"],
+                candidate_count=len(preview_candidates),
+                eligible_count=eligible_count,
+            )
+
         add_pair(
             pairs,
             "generation_samples",
@@ -982,6 +1146,8 @@ class Wan22Trainer:
                     "samples": self.print_prediction_samples,
                     "steps": self.print_prediction_steps,
                     "precision": self.print_prediction_precision,
+                    "selection": self.print_prediction_selection,
+                    "min_force_nonzero_ratio": self.print_prediction_min_force_nonzero_ratio,
                 },
                 "contract_hashes": getattr(self.val_dataset, "contract_hashes", {}),
             }
@@ -1484,16 +1650,10 @@ class Wan22Trainer:
                 if self.accelerator.sync_gradients:
                     grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     bridge_diag_snapshot = None
-                    diagnostics_fn = getattr(self.accelerator.unwrap_model(self.model).dit, "bridge_diagnostics", None)
-                    if diagnostics_fn is not None:
-                        bridge_diag_snapshot = {}
-                        for bridge, values in diagnostics_fn().items():
-                            bridge_diag_snapshot[bridge] = {
-                                "raw": float(values["raw"].float().item()),
-                                "tanh": float(values["tanh"].float().item()),
-                                "grad": 0.0 if values["grad"] is None else float(values["grad"].float().item()),
-                                "residual_rms": 0.0 if values["residual_rms"] is None else float(values["residual_rms"].float().item()),
-                            }
+                    if self.log_every > 0 and (self.global_step + 1) % self.log_every == 0:
+                        bridge_diag_snapshot = self._collect_bridge_diagnostics(
+                            self.accelerator.unwrap_model(self.model)
+                        )
                     self.optimizer.step()
                     if not self.accelerator.optimizer_step_was_skipped:
                         self.scheduler.step()
@@ -1531,6 +1691,7 @@ class Wan22Trainer:
                             eta_str,
                         )
                         logger.info(description)
+                        self._log_bridge_diagnostic_snapshot(bridge_diag_snapshot)
 
                         wandb_payload = {
                             "train/loss": global_loss,
@@ -1547,6 +1708,7 @@ class Wan22Trainer:
                                 wandb_payload[f"bridge/{bridge}/tanh_gate"] = values["tanh"]
                                 wandb_payload[f"bridge/{bridge}/grad"] = values["grad"]
                                 wandb_payload[f"bridge/{bridge}/residual_rms"] = values["residual_rms"]
+                                wandb_payload[f"bridge/{bridge}/effective_rms"] = values["effective_rms"]
                         self._wandb_log(wandb_payload)
 
                     if (

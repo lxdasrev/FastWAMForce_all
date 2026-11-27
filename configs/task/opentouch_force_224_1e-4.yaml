@@ -23,6 +23,7 @@ training:
   stage: joint
   force_warmup_steps: 1000
   finetune_video: false
+  print_bridge_diagnostics: true
   joint_eval_every: 2000
   tactile_ablation_every: 2000
 
@@ -33,6 +34,8 @@ evaluation:
   print_prediction_samples: 1
   print_prediction_steps: 32
   print_prediction_precision: 5
+  print_prediction_selection: contact_random
+  print_prediction_min_force_nonzero_ratio: 0.25
   checkpoint: null
   output_dir: null
   offline_loss_samples: 0
