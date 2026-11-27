@@ -29,6 +29,10 @@ training:
 evaluation:
   loss_samples: 64
   generation_samples: 16
+  print_predictions: true
+  print_prediction_samples: 1
+  print_prediction_steps: 32
+  print_prediction_precision: 5
   checkpoint: null
   output_dir: null
   offline_loss_samples: 0

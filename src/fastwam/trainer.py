@@ -54,6 +54,7 @@ class Wan22Trainer:
         instance.eval_loss_samples = configured_loss or len(val_dataset)
         configured_generation = int(evaluation_cfg.get("offline_generation_samples", 0))
         instance.eval_generation_samples = configured_generation or len(val_dataset)
+        instance._configure_prediction_logging(evaluation_cfg)
         instance.global_step = 1
         # Match the train-time stage semantics before running loss validation.
         # In particular, force_warmup must not report video/action losses as
@@ -100,6 +101,7 @@ class Wan22Trainer:
         evaluation_cfg = cfg.get("evaluation", {})
         self.eval_loss_samples = int(evaluation_cfg.get("loss_samples", 64))
         self.eval_generation_samples = int(evaluation_cfg.get("generation_samples", 16))
+        self._configure_prediction_logging(evaluation_cfg)
 
         self.accelerator = Accelerator(
             gradient_accumulation_steps=self.gradient_accumulation_steps,
@@ -410,6 +412,107 @@ class Wan22Trainer:
             model.loss_lambda_video = configured_video
             model.loss_lambda_action = configured_action
         model.loss_lambda_force = configured_force
+
+    def _configure_prediction_logging(self, evaluation_cfg) -> None:
+        self.print_eval_predictions = bool(evaluation_cfg.get("print_predictions", True))
+        self.print_prediction_samples = int(evaluation_cfg.get("print_prediction_samples", 1))
+        self.print_prediction_steps = int(evaluation_cfg.get("print_prediction_steps", 32))
+        self.print_prediction_precision = int(evaluation_cfg.get("print_prediction_precision", 5))
+        if self.print_prediction_samples < 0:
+            raise ValueError("evaluation.print_prediction_samples must be non-negative")
+        if not 0 <= self.print_prediction_steps <= 32:
+            raise ValueError("evaluation.print_prediction_steps must be between 0 and 32")
+        if not 0 <= self.print_prediction_precision <= 10:
+            raise ValueError("evaluation.print_prediction_precision must be between 0 and 10")
+
+    def _format_eval_vector(self, values: torch.Tensor, valid: torch.Tensor | bool) -> str:
+        values = values.detach().float().cpu().reshape(-1)
+        if isinstance(valid, torch.Tensor):
+            mask = valid.detach().bool().cpu().reshape(-1)
+            if mask.numel() == 1:
+                mask = mask.expand(values.numel())
+            elif mask.numel() != values.numel():
+                raise ValueError(
+                    f"prediction log mask/value mismatch: {mask.numel()} vs {values.numel()}"
+                )
+        else:
+            mask = torch.full((values.numel(),), bool(valid), dtype=torch.bool)
+        precision = self.print_prediction_precision
+        formatted = []
+        for value, is_valid in zip(values.tolist(), mask.tolist()):
+            if not is_valid:
+                formatted.append("NA")
+            elif np.isfinite(value):
+                formatted.append(f"{value:.{precision}f}")
+            else:
+                formatted.append(str(value))
+        return "[" + ", ".join(formatted) + "]"
+
+    def _log_opentouch_prediction_preview(
+        self,
+        *,
+        sample: dict,
+        sample_number: int,
+        action_pred_canonical: torch.Tensor | None,
+        action_gt_canonical: torch.Tensor | None,
+        action_valid: torch.Tensor | None,
+        force_pred_pressure: torch.Tensor | None,
+        force_gt_pressure: torch.Tensor | None,
+        force_valid: torch.Tensor | None,
+    ) -> None:
+        if (
+            not self.print_eval_predictions
+            or not self.accelerator.is_main_process
+            or sample_number >= self.print_prediction_samples
+            or self.print_prediction_steps == 0
+        ):
+            return
+        observed = sample.get("force_observed_frames")
+        history_frames = None if observed is None else int(observed) - 1
+        lines = [
+            "[opentouch-prediction] "
+            f"global_step={self.global_step} sample={sample_number + 1} "
+            f"sequence_id={sample['sequence_id']} current_frame={int(sample['current_frame'])} "
+            f"split_group={sample['split_group']} stage={self.training_stage} "
+            f"history_frames={history_frames} observed_force_frames={observed}"
+        ]
+        max_steps = self.print_prediction_steps
+        if action_pred_canonical is not None:
+            if action_gt_canonical is None or action_valid is None:
+                raise ValueError("action prediction logging requires GT and validity")
+            steps = min(max_steps, action_pred_canonical.shape[0])
+            lines.append(
+                "ACTION canonical columns=[dx,dy,dz,drx,dry,drz,gripper_target]"
+            )
+            for step in range(steps):
+                valid = bool(action_valid[step])
+                pred = action_pred_canonical[step]
+                gt = action_gt_canonical[step]
+                error = (pred - gt).abs()
+                lines.append(
+                    f"action step={step:02d} valid={int(valid)} "
+                    f"pred={self._format_eval_vector(pred, valid)} "
+                    f"gt={self._format_eval_vector(gt, valid)} "
+                    f"abs_error={self._format_eval_vector(error, valid)}"
+                )
+        if force_pred_pressure is not None:
+            if force_gt_pressure is None or force_valid is None:
+                raise ValueError("force prediction logging requires GT and validity")
+            steps = min(max_steps, force_pred_pressure.shape[0])
+            lines.append("FORCE relative_pressure columns=[thumb,index] unit=relative_pressure_not_newton")
+            for step in range(steps):
+                valid = force_valid[step].bool()
+                pred = force_pred_pressure[step]
+                gt = force_gt_pressure[step]
+                error = (pred - gt).abs()
+                valid_text = "[" + ",".join(str(int(value)) for value in valid.tolist()) + "]"
+                lines.append(
+                    f"force step={step:02d} valid={valid_text} "
+                    f"pred={self._format_eval_vector(pred, valid)} "
+                    f"gt={self._format_eval_vector(gt, valid)} "
+                    f"abs_error={self._format_eval_vector(error, valid)}"
+                )
+        logger.info("%s", "\n".join(lines))
 
     @staticmethod
     def _to_batched_eval_sample(sample):
@@ -724,14 +827,22 @@ class Wan22Trainer:
             saved["action_pred_normalized"].append(action_pred.numpy())
             saved["action_gt_normalized"].append(action_gt.numpy())
             saved["action_valid"].append(action_valid.numpy())
-            saved["action_pred_canonical"].append(
-                self.val_dataset.denormalize_action(action_pred).numpy()
-            )
-            saved["action_gt_canonical"].append(
-                self.val_dataset.denormalize_action(action_gt).numpy()
-            )
+            action_pred_canonical = self.val_dataset.denormalize_action(action_pred).detach().float().cpu()
+            action_gt_canonical = self.val_dataset.denormalize_action(action_gt).detach().float().cpu()
+            saved["action_pred_canonical"].append(action_pred_canonical.numpy())
+            saved["action_gt_canonical"].append(action_gt_canonical.numpy())
 
             if not force_enabled:
+                self._log_opentouch_prediction_preview(
+                    sample=sample,
+                    sample_number=local_position,
+                    action_pred_canonical=action_pred_canonical if report_action else None,
+                    action_gt_canonical=action_gt_canonical if report_action else None,
+                    action_valid=action_valid if report_action else None,
+                    force_pred_pressure=None,
+                    force_gt_pressure=None,
+                    force_valid=None,
+                )
                 continue
             observed = int(sample["force_observed_frames"])
             future_gt = sample["force"][0, observed:].float().cpu()
@@ -758,18 +869,27 @@ class Wan22Trainer:
             saved["force_pred_normalized"].append(future_pred.numpy())
             saved["force_gt_normalized"].append(future_gt.numpy())
             saved["effective_force_valid"].append(effective_future.numpy())
-            saved["force_pred_relative_pressure"].append(
-                self.val_dataset.denormalize_force(future_pred).numpy()
-            )
-            saved["force_gt_relative_pressure"].append(
-                self.val_dataset.denormalize_force(future_gt).numpy()
-            )
+            force_pred_pressure = self.val_dataset.denormalize_force(future_pred).detach().float().cpu()
+            force_gt_pressure = self.val_dataset.denormalize_force(future_gt).detach().float().cpu()
+            saved["force_pred_relative_pressure"].append(force_pred_pressure.numpy())
+            saved["force_gt_relative_pressure"].append(force_gt_pressure.numpy())
             saved["observed_force_normalized"].append(sample["force"][0, :observed].numpy())
             saved["observed_force_valid"].append(
                 (
                     sample["force_valid"][0, :observed].bool()
                     & ~sample["force_is_pad"][0, :observed].bool()
                 ).numpy()
+            )
+
+            self._log_opentouch_prediction_preview(
+                sample=sample,
+                sample_number=local_position,
+                action_pred_canonical=action_pred_canonical if report_action else None,
+                action_gt_canonical=action_gt_canonical if report_action else None,
+                action_valid=action_valid if report_action else None,
+                force_pred_pressure=force_pred_pressure,
+                force_gt_pressure=force_gt_pressure,
+                force_valid=effective_future,
             )
 
             if not run_ablation:
@@ -853,6 +973,12 @@ class Wan22Trainer:
                 "action_dit_pretrained_path": self.cfg.get("model", {}).get(
                     "action_dit_pretrained_path"
                 ),
+                "prediction_logging": {
+                    "enabled": self.print_eval_predictions,
+                    "samples": self.print_prediction_samples,
+                    "steps": self.print_prediction_steps,
+                    "precision": self.print_prediction_precision,
+                },
                 "contract_hashes": getattr(self.val_dataset, "contract_hashes", {}),
             }
             output_path.with_suffix(".json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")

@@ -99,6 +99,16 @@ without treating its untrained action as an effect metric. A model configured wi
 `infer_action` as the action-only baseline. Both 1-frame and 17-frame observed
 force modes are inferred from the cache contract.
 
+By default each generation evaluation also logs the first fixed sample's full
+32-step prediction/target comparison. Actions are printed in denormalized
+canonical coordinates (`dx,dy,dz,drx,dry,drz,gripper_target`), and force is
+printed as two-finger relative pressure rather than Newtons. Invalid or padded
+elements are shown as `NA`. Control this with `evaluation.print_predictions`,
+`print_prediction_samples`, `print_prediction_steps`, and
+`print_prediction_precision`. Only rank zero prints, warmup prints force only,
+and action-only baselines print action only; ablation tensors remain in NPZ
+files instead of being expanded into the console log.
+
 Run a strict checkpoint-bound offline evaluation with one non-overlapping
 contact window per validation sequence group:
 
