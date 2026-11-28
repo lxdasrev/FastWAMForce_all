@@ -68,7 +68,7 @@ class OpenTouchForceDataset(torch.utils.data.Dataset):
         self.stats = dict(np.load(stats_path))
         required_force_stats = {
             "force_knee", "force_upper", "force_normalization_max",
-            "force_clip_min", "force_clip_max",
+            "force_clip_min", "force_clip_max", "pressure_adc_reference",
         }
         missing_force_stats = required_force_stats.difference(self.stats)
         if missing_force_stats:
@@ -82,10 +82,10 @@ class OpenTouchForceDataset(torch.utils.data.Dataset):
             raise ValueError(
                 f"OpenTouch cache version mismatch: expected {DATA_VERSION}, "
                 f"contract={contract_version!r}, manifest={manifest_version!r}; "
-                "rebuild the cache and do not resume a v1 Force checkpoint"
+                "rebuild the cache and do not resume a v1/v2 Force checkpoint"
             )
         if not quality_path.exists():
-            raise FileNotFoundError(f"missing OpenTouch v2 quality artifact: {quality_path}")
+            raise FileNotFoundError(f"missing OpenTouch v3 quality artifact: {quality_path}")
         knee = np.asarray(self.stats["force_knee"], dtype=np.float64)
         upper = np.asarray(self.stats["force_upper"], dtype=np.float64)
         normalization_max = np.asarray(self.stats["force_normalization_max"], dtype=np.float64)
@@ -96,10 +96,12 @@ class OpenTouchForceDataset(torch.utils.data.Dataset):
             and np.isfinite(normalization_max).all() and np.all(knee > 0)
             and np.all(upper > knee) and np.all(normalization_max > 0)
         ):
-            raise ValueError("invalid v2 force normalization constants")
+            raise ValueError("invalid v3 force normalization constants")
         expected_max = np.arcsinh(upper / knee)
         if not np.allclose(normalization_max, expected_max, rtol=1e-5, atol=1e-6):
             raise ValueError("force_normalization_max is inconsistent with force_knee/force_upper")
+        if not np.isclose(float(np.asarray(self.stats["pressure_adc_reference"])), 3072.0):
+            raise ValueError("OpenTouch v3 requires pressure_adc_reference=3072")
         self.force_semantics = str(self.contract.get("force_semantics", "unknown"))
         self.contract_hashes = json.loads(hashes_path.read_text(encoding="utf-8"))
         if strict_contract:
@@ -154,7 +156,7 @@ class OpenTouchForceDataset(torch.utils.data.Dataset):
         return action * scale + mean
 
     def denormalize_force(self, force):
-        """Return baseline-corrected relative pressure, never raw ADC or Newtons."""
+        """Return direct max(3072-ADC,0) relative pressure, never Newtons."""
         knee = self._stat_like(self.stats["force_knee"], force)
         normalization_max = self._stat_like(self.stats["force_normalization_max"], force)
         clip_min = float(np.asarray(self.stats["force_clip_min"]))
@@ -169,25 +171,33 @@ class OpenTouchForceDataset(torch.utils.data.Dataset):
         record = self.records.get(item["sequence_id"], {})
         return str(item.get("split_group", record.get("split_group", item["sequence_id"])))
 
-    def _window_has_contact(self, item: dict) -> bool:
+    def _window_activity_score(self, item: dict) -> float:
+        """Maximum per-finger normalized range over the 32 future frames."""
+        if "force_activity_score" in item:
+            return float(item["force_activity_score"])
         record = self.records.get(item["sequence_id"], {})
         cache_file = item.get("cache_file", record.get("cache_file"))
         if cache_file is None:
-            return False
+            return 0.0
         current = int(item["current_frame"])
-        start = current - self.force_history_frames
+        start = current + 1
         stop = current + 33
         with np.load(self.cache_dir / cache_file) as cache:
-            contact = np.asarray(cache["force_contact"][start:stop], dtype=bool)
+            pressure = np.asarray(cache["force_relative_pressure"][start:stop], dtype=np.float32)
             valid = np.asarray(cache["force_valid"][start:stop], dtype=bool)
-        return bool(np.any(valid & contact))
+        normalized = normalize_force(pressure, self.stats)
+        ranges = []
+        for finger in range(2):
+            values = normalized[:, finger][valid[:, finger]]
+            ranges.append(float(np.ptp(values)) if values.size >= 2 else 0.0)
+        return max(ranges)
 
     def fixed_eval_indices(
         self,
         count: int,
         *,
         seed: int = 42,
-        contact_only: bool = False,
+        activity_ranked: bool = False,
         unique_groups: bool = False,
     ) -> list[int]:
         """Select deterministic, sequence-group-stratified validation indices."""
@@ -203,7 +213,15 @@ class OpenTouchForceDataset(torch.utils.data.Dataset):
 
         group_names = sorted(grouped, key=stable_key)
         for group in group_names:
-            grouped[group].sort(key=lambda index: stable_key(f"{group}:{index}"))
+            if activity_ranked:
+                grouped[group].sort(
+                    key=lambda index: (
+                        -self._window_activity_score(self.windows[index]),
+                        stable_key(f"{group}:{index}"),
+                    )
+                )
+            else:
+                grouped[group].sort(key=lambda index: stable_key(f"{group}:{index}"))
         selected: list[int] = []
         selected_groups: set[str] = set()
         depth = 0
@@ -216,11 +234,10 @@ class OpenTouchForceDataset(torch.utils.data.Dataset):
                 if depth >= len(candidates):
                     continue
                 index = candidates[depth]
-                if not contact_only or self._window_has_contact(self.windows[index]):
-                    selected.append(index)
-                    selected_groups.add(group)
-                    if len(selected) == count:
-                        break
+                selected.append(index)
+                selected_groups.add(group)
+                if len(selected) == count:
+                    break
                 added = True
             if not added:
                 break
@@ -292,7 +309,7 @@ class OpenTouchForceDataset(torch.utils.data.Dataset):
             pose_valid = bool(cache["pose_valid"][current])
             force_start = current - self.force_history_frames
             force_stop = current + 33
-            force = np.asarray(cache["force_clean"][force_start:force_stop], dtype=np.float32)
+            force = np.asarray(cache["force_relative_pressure"][force_start:force_stop], dtype=np.float32)
             force_valid = np.asarray(cache["force_valid"][force_start:force_stop], dtype=bool)
             force_contact = np.asarray(cache["force_contact"][force_start:force_stop], dtype=bool)
         if len(action) != 32 or len(force) != self.force_observed_frames + 32:

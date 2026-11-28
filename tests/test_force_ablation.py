@@ -36,7 +36,10 @@ def test_bootstrap_output_summary(tmp_path):
         correct_action_mse=np.asarray([0.8, 0.7, 0.6]),
         zero_action_mse=np.asarray([1.0, 0.9, 0.8]),
         batch_shuffle_action_mse=np.asarray([1.1, 1.0, 0.9]),
+        future_force_activity_score=np.asarray([0.1, 0.5, 0.9]),
     )
     result = summarize_bootstrap_outputs(tmp_path, samples=1000, seed=42)
     assert result["num_groups"] == 3
     assert result["passes_success_criterion"]
+    assert result["high_activity"]["num_examples"] == 2
+    assert result["high_activity"]["passes_success_criterion"]

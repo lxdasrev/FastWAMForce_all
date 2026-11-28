@@ -88,8 +88,11 @@ def summarize_bootstrap_outputs(
     *,
     samples: int = 10000,
     seed: int = 42,
+    activity_top_fraction: float = 0.5,
 ) -> dict[str, object]:
-    """Aggregate rank-local OpenTouch NPZ files and run paired group bootstraps."""
+    """Aggregate rank-local outputs and bootstrap all/high-activity subsets."""
+    if not 0.0 < activity_top_fraction <= 1.0:
+        raise ValueError("activity_top_fraction must be in (0,1]")
     paths = sorted(Path(eval_dir).glob("opentouch_generation_step_*_rank_*.npz"))
     if not paths:
         raise FileNotFoundError(f"no OpenTouch generation results found in {eval_dir}")
@@ -105,6 +108,7 @@ def summarize_bootstrap_outputs(
         "num_groups": int(len(np.unique(groups))),
         "bootstrap_samples": int(samples),
         "seed": int(seed),
+        "activity_top_fraction": float(activity_top_fraction),
         "ablations": {},
     }
     correct = arrays.get("correct_action_mse")
@@ -130,4 +134,37 @@ def summarize_bootstrap_outputs(
     summary["passes_success_criterion"] = bool(
         all(item is not None and item["passes_2pct"] for item in required)
     )
+    activity = arrays.get("future_force_activity_score")
+    if activity is not None and len(activity) == len(groups):
+        finite_activity = np.isfinite(activity)
+        cutoff = float(np.quantile(activity[finite_activity], 1.0 - activity_top_fraction)) if bool(
+            finite_activity.any()
+        ) else 0.0
+        activity_mask = finite_activity & (activity >= cutoff)
+        high: dict[str, object] = {
+            "activity_cutoff": cutoff,
+            "num_examples": int(activity_mask.sum()),
+            "num_groups": int(len(np.unique(groups[activity_mask]))),
+            "ablations": {},
+        }
+        for name in (
+            "zero_action_mse",
+            "batch_shuffle_action_mse",
+            "time_shuffle_action_mse",
+            "disable_future_force_to_action_action_mse",
+        ):
+            ablated = arrays.get(name)
+            if ablated is None:
+                continue
+            valid = activity_mask & np.isfinite(correct) & np.isfinite(ablated)
+            if not bool(valid.any()):
+                continue
+            high["ablations"][name.removesuffix("_action_mse")] = paired_group_bootstrap(
+                correct[valid], ablated[valid], groups[valid], samples=samples, seed=seed
+            )
+        required_high = [high["ablations"].get(name) for name in ("zero", "batch_shuffle")]
+        high["passes_success_criterion"] = bool(
+            all(item is not None and item["passes_2pct"] for item in required_high)
+        )
+        summary["high_activity"] = high
     return summary

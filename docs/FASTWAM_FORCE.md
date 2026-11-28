@@ -30,15 +30,17 @@ The output contract contains:
   `knee`, `upper` and asinh normalization constants;
 - `data_contract.json`: coordinate, unit, timing, taxel and dimension semantics;
 - `split_manifest.json`: sequence groups and every legal training window;
-- `force_quality_report.json`: per-split zero, saturation, contact and temporal
+- `force_quality_report.json`: per-split zero, saturation, positive-value and temporal
   variation diagnostics;
 - `contract_hashes.json`: strict hashes used by resume and inference.
 
-Force cache version v2 estimates a median baseline and MAD noise independently
-for each demo/finger, applies a smooth 2-sigma to 4-sigma deadband, then maps
-baseline-corrected relative pressure to `[0,1]` with train-only statistics. Old
-v1 caches and Force checkpoints are intentionally rejected; rebuild the cache
-and restart Force warmup. Wan/ActionDiT initialization remains reusable.
+Force cache version v3 directly averages `max(3072 - raw_adc, 0)` over valid
+thumb/index fingertip taxels, then maps that relative ADC deficit to `[0,1]`
+with train-only positive-value asinh statistics. There is no per-demo baseline,
+MAD calibration or deadband. ADC readings at or above 3072 are valid no-contact
+values; non-finite or non-positive readings are invalid. Old v1/v2 caches and
+Force checkpoints are intentionally rejected; rebuild the cache and restart
+Force warmup. Wan/ActionDiT initialization remains reusable.
 
 Generate the prompt embeddings after the cache exists:
 
@@ -101,7 +103,8 @@ The original `infer_action` remains the no-force baseline.
 OpenTouch validation never calls the legacy future-video rollout. Every
 `eval_every` steps it evaluates deterministic flow losses on 64 fixed,
 sequence-group-stratified windows. Every `training.joint_eval_every` steps it
-jointly generates action/force on 16 fixed contact groups; tactile ablations are
+jointly generates action/force on 16 fixed sequence groups, selecting the
+highest future-Force dynamic-range window in each group; tactile ablations are
 controlled independently by `training.tactile_ablation_every`. Warmup reports
 force loss and, when the generation cadence is reached, future-force metrics
 without treating its untrained action as an effect metric. A model configured without ForceExpert uses
@@ -109,14 +112,14 @@ without treating its untrained action as an effect metric. A model configured wi
 force modes are inferred from the cache contract.
 
 By default each generation evaluation also logs one sample's full
-32-step prediction/target comparison. With `print_prediction_selection=contact_random`,
+32-step prediction/target comparison. With `print_prediction_selection=activity_random`,
 the formal fixed evaluation set remains unchanged while the console preview is
-chosen reproducibly from rank zero's candidates whose valid future Force has at
-least 25% contact; if none qualifies, the most contact-rich sample is shown.
+chosen reproducibly from the top 50% of rank zero's candidates ranked by the
+maximum valid thumb/index range over the 32 future normalized Force frames.
 Actions are printed in denormalized
 canonical coordinates (`dx,dy,dz,drx,dry,drz,gripper_target`), and force is
-printed as baseline-corrected two-finger relative pressure rather than Newtons
-or raw ADC. Invalid or padded
+printed as two-finger `max(3072-ADC,0)` relative pressure rather than Newtons.
+Invalid or padded
 elements are shown as `NA`. Control this with `evaluation.print_predictions`,
 `print_prediction_samples`, `print_prediction_steps`, and
 `print_prediction_precision`. Only rank zero prints, warmup prints force only,
@@ -129,8 +132,8 @@ seven H-Bridge raw/tanh gates, clipped gradients, residual RMS and
 joint training reports trainable gates. The same values remain available in
 W&B under `bridge/<force_layer>/...`.
 
-Run a strict checkpoint-bound offline evaluation with one non-overlapping
-contact window per validation sequence group:
+Run a strict checkpoint-bound offline evaluation with one non-overlapping,
+high-dynamic-range window per validation sequence group:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
@@ -143,6 +146,7 @@ python scripts/evaluate_opentouch.py \
 Use `data.val.split=test` for the test split. The command writes normalized and
 canonical action predictions, normalized and relative-pressure force
 predictions, effective masks, identifiers, aggregate metrics and a 10,000-draw
-paired sequence-group bootstrap summary. The primary success rule requires the
+paired sequence-group bootstrap summary for both all generated examples and
+the configured high-activity subset. The primary success rule requires the
 correct-force action MSE to improve by at least 2% over both zero and shuffled
 force, with a positive 95% confidence-interval lower bound.

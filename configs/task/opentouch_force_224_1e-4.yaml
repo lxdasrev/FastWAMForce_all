@@ -34,8 +34,8 @@ evaluation:
   print_prediction_samples: 1
   print_prediction_steps: 32
   print_prediction_precision: 5
-  print_prediction_selection: contact_random
-  print_prediction_min_force_nonzero_ratio: 0.25
+  print_prediction_selection: activity_random
+  print_prediction_activity_top_fraction: 0.5
   checkpoint: null
   output_dir: null
   offline_loss_samples: 0

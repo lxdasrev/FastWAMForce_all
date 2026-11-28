@@ -1599,14 +1599,16 @@ class FastWAM(torch.nn.Module):
                 normalization = dict(np.load(normalization))
             required_force_stats = {
                 "force_knee", "force_upper", "force_normalization_max",
-                "force_clip_min", "force_clip_max",
+                "force_clip_min", "force_clip_max", "pressure_adc_reference",
             }
             missing_force_stats = required_force_stats.difference(normalization)
             if missing_force_stats:
                 raise ValueError(
                     "obsolete OpenTouch force normalization supplied to inference; "
-                    f"missing {sorted(missing_force_stats)}. Rebuild the v2 cache."
+                    f"missing {sorted(missing_force_stats)}. Rebuild the v3 direct-ADC cache."
                 )
+            if not np.isclose(float(np.asarray(normalization["pressure_adc_reference"])), 3072.0):
+                raise ValueError("OpenTouch v3 inference requires pressure_adc_reference=3072")
             action_mean = torch.as_tensor(normalization["action_mean"], dtype=torch.float32)
             action_scale = torch.as_tensor(normalization["action_scale"], dtype=torch.float32)
             force_knee = torch.as_tensor(normalization["force_knee"], dtype=torch.float32)
@@ -1707,7 +1709,7 @@ class FastWAM(torch.nn.Module):
                         message = (
                             "Force checkpoint uses an incompatible OpenTouch data contract: "
                             f"{contract_version!r} != {OPENTOUCH_DATA_VERSION!r}. "
-                            "Rebuild the cache and restart Force warmup; do not resume v1 Force weights."
+                            "Rebuild the cache and restart Force warmup; do not resume v1/v2 Force weights."
                         )
                         if strict_contract:
                             raise ValueError(message)

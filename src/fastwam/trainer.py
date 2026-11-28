@@ -421,10 +421,10 @@ class Wan22Trainer:
         self.print_prediction_steps = int(evaluation_cfg.get("print_prediction_steps", 32))
         self.print_prediction_precision = int(evaluation_cfg.get("print_prediction_precision", 5))
         self.print_prediction_selection = str(
-            evaluation_cfg.get("print_prediction_selection", "contact_random")
+            evaluation_cfg.get("print_prediction_selection", "activity_random")
         ).strip().lower()
-        self.print_prediction_min_force_nonzero_ratio = float(
-            evaluation_cfg.get("print_prediction_min_force_nonzero_ratio", 0.25)
+        self.print_prediction_activity_top_fraction = float(
+            evaluation_cfg.get("print_prediction_activity_top_fraction", 0.5)
         )
         if self.print_prediction_samples < 0:
             raise ValueError("evaluation.print_prediction_samples must be non-negative")
@@ -432,15 +432,20 @@ class Wan22Trainer:
             raise ValueError("evaluation.print_prediction_steps must be between 0 and 32")
         if not 0 <= self.print_prediction_precision <= 10:
             raise ValueError("evaluation.print_prediction_precision must be between 0 and 10")
-        allowed_selection = {"contact_random", "fixed", "max_contact", "random"}
+        if self.print_prediction_selection in {"contact_random", "max_contact"}:
+            raise ValueError(
+                "contact-based prediction selection is obsolete for the OpenTouch v3 direct-ADC "
+                "contract; use evaluation.print_prediction_selection=activity_random"
+            )
+        allowed_selection = {"activity_random", "fixed", "max_activity", "random"}
         if self.print_prediction_selection not in allowed_selection:
             raise ValueError(
                 "evaluation.print_prediction_selection must be one of "
                 f"{sorted(allowed_selection)}, got {self.print_prediction_selection!r}"
             )
-        if not 0.0 <= self.print_prediction_min_force_nonzero_ratio <= 1.0:
+        if not 0.0 < self.print_prediction_activity_top_fraction <= 1.0:
             raise ValueError(
-                "evaluation.print_prediction_min_force_nonzero_ratio must be between 0 and 1"
+                "evaluation.print_prediction_activity_top_fraction must be in (0,1]"
             )
 
     def _format_eval_vector(self, values: torch.Tensor, valid: torch.Tensor | bool) -> str:
@@ -467,7 +472,7 @@ class Wan22Trainer:
         return "[" + ", ".join(formatted) + "]"
 
     @staticmethod
-    def _future_force_nonzero_ratio(sample: dict) -> float:
+    def _future_force_activity_score(sample: dict) -> float:
         force = sample.get("force")
         if force is None:
             return 0.0
@@ -478,24 +483,26 @@ class Wan22Trainer:
         )
         if not bool(effective.any()):
             return 0.0
-        contact = sample.get("force_contact")
-        if contact is None:
-            contact = sample["force"][0, observed:].detach().float().cpu() > 0
-        else:
-            contact = contact[0, observed:].bool().cpu()
-        return float((contact & effective).sum().item() / effective.sum().item())
+        future = force[0, observed:].detach().float().cpu()
+        ranges = []
+        for finger in range(2):
+            values = future[:, finger][effective[:, finger]]
+            ranges.append(float((values.max() - values.min()).item()) if values.numel() >= 2 else 0.0)
+        return max(ranges)
 
     def _select_prediction_previews(self, candidates: list[dict]) -> tuple[list[dict], int]:
         if not candidates or self.print_prediction_samples <= 0:
             return [], 0
         count = min(self.print_prediction_samples, len(candidates))
-        threshold = self.print_prediction_min_force_nonzero_ratio
-        eligible = [candidate for candidate in candidates if candidate["nonzero_ratio"] >= threshold]
         mode = self.print_prediction_selection
+        ranked = sorted(candidates, key=lambda item: item["activity_score"], reverse=True)
+        eligible_count = max(count, int(np.ceil(len(candidates) * self.print_prediction_activity_top_fraction)))
+        eligible = ranked[:eligible_count]
+        if ranked[0]["activity_score"] <= 0.0:
+            eligible = ranked[:count]
         if mode == "fixed":
             return candidates[:count], len(eligible)
-        if mode == "max_contact":
-            ranked = sorted(candidates, key=lambda item: item["nonzero_ratio"], reverse=True)
+        if mode == "max_activity":
             return ranked[:count], len(eligible)
 
         rng = np.random.default_rng(self.seed + self.global_step)
@@ -503,16 +510,6 @@ class Wan22Trainer:
             pool = list(candidates)
         else:
             pool = list(eligible)
-            if len(pool) < count:
-                selected_ids = {id(candidate) for candidate in pool}
-                remainder = sorted(
-                    (candidate for candidate in candidates if id(candidate) not in selected_ids),
-                    key=lambda item: item["nonzero_ratio"],
-                    reverse=True,
-                )
-                pool.extend(remainder[:count - len(pool)])
-        if not pool:
-            pool = sorted(candidates, key=lambda item: item["nonzero_ratio"], reverse=True)[:count]
         chosen = rng.choice(len(pool), size=min(count, len(pool)), replace=False)
         return [pool[int(index)] for index in np.atleast_1d(chosen)], len(eligible)
 
@@ -582,7 +579,7 @@ class Wan22Trainer:
         force_pred_pressure: torch.Tensor | None,
         force_gt_pressure: torch.Tensor | None,
         force_valid: torch.Tensor | None,
-        nonzero_ratio: float,
+        activity_score: float,
         candidate_count: int,
         eligible_count: int,
     ) -> None:
@@ -602,7 +599,7 @@ class Wan22Trainer:
             f"split_group={sample['split_group']} stage={self.training_stage} "
             f"history_frames={history_frames} observed_force_frames={observed} "
             f"selection={self.print_prediction_selection} "
-            f"future_force_nonzero_ratio={nonzero_ratio:.4f} "
+            f"future_force_activity_score={activity_score:.4f} "
             f"candidate_count={candidate_count} eligible_count={eligible_count}"
         ]
         max_steps = self.print_prediction_steps
@@ -629,8 +626,8 @@ class Wan22Trainer:
                 raise ValueError("force prediction logging requires GT and validity")
             steps = min(max_steps, force_pred_pressure.shape[0])
             lines.append(
-                "FORCE baseline_corrected_relative_pressure columns=[thumb,index] "
-                "unit=relative_pressure_not_newton_not_raw_adc"
+                "FORCE relative_pressure_3072_minus_adc columns=[thumb,index] "
+                "unit=relative_adc_pressure_not_newton"
             )
             for step in range(steps):
                 valid = force_valid[step].bool()
@@ -779,18 +776,13 @@ class Wan22Trainer:
             result[f"{name}_count"] = float(denominator)
         return result
 
-    def _rank_eval_indices(self, count: int, *, contact_only: bool) -> tuple[list[int], list[int]]:
+    def _rank_eval_indices(self, count: int, *, activity_ranked: bool) -> tuple[list[int], list[int]]:
         indices = self.val_dataset.fixed_eval_indices(
             count,
             seed=self.seed,
-            contact_only=contact_only,
-            unique_groups=contact_only,
+            activity_ranked=activity_ranked,
+            unique_groups=activity_ranked,
         )
-        if contact_only and not indices:
-            logger.warning("No contact validation windows were found; falling back to all validation windows.")
-            indices = self.val_dataset.fixed_eval_indices(
-                count, seed=self.seed, contact_only=False, unique_groups=contact_only
-            )
         rank = int(self.accelerator.process_index)
         world = int(self.accelerator.num_processes)
         return indices, indices[rank::world]
@@ -806,7 +798,7 @@ class Wan22Trainer:
         return {"prompt": sample["prompt"][0], "context": None, "context_mask": None}
 
     def _evaluate_opentouch_losses(self, model) -> dict[str, float]:
-        _, local_indices = self._rank_eval_indices(self.eval_loss_samples, contact_only=False)
+        _, local_indices = self._rank_eval_indices(self.eval_loss_samples, activity_ranked=False)
         pairs: dict[str, tuple[float, float]] = {}
         for index in local_indices:
             sample = self._to_batched_eval_sample(self.val_dataset[index])
@@ -897,7 +889,7 @@ class Wan22Trainer:
         report_action: bool = True,
     ) -> dict[str, float]:
         all_indices, local_indices = self._rank_eval_indices(
-            self.eval_generation_samples, contact_only=True
+            self.eval_generation_samples, activity_ranked=True
         )
         pairs: dict[str, tuple[float, float]] = {}
         saved: dict[str, list] = {
@@ -970,6 +962,8 @@ class Wan22Trainer:
             action_gt_canonical = self.val_dataset.denormalize_action(action_gt).detach().float().cpu()
             saved["action_pred_canonical"].append(action_pred_canonical.numpy())
             saved["action_gt_canonical"].append(action_gt_canonical.numpy())
+            activity_score = self._future_force_activity_score(sample)
+            saved.setdefault("future_force_activity_score", []).append(activity_score)
 
             if not force_enabled:
                 if self.accelerator.is_main_process and self.print_eval_predictions:
@@ -980,7 +974,7 @@ class Wan22Trainer:
                             "split_group": sample["split_group"],
                             "force_observed_frames": sample["force_observed_frames"],
                         },
-                        "nonzero_ratio": self._future_force_nonzero_ratio(sample),
+                        "activity_score": activity_score,
                         "action_pred_canonical": action_pred_canonical if report_action else None,
                         "action_gt_canonical": action_gt_canonical if report_action else None,
                         "action_valid": action_valid if report_action else None,
@@ -1034,7 +1028,7 @@ class Wan22Trainer:
                         "split_group": sample["split_group"],
                         "force_observed_frames": sample["force_observed_frames"],
                     },
-                    "nonzero_ratio": self._future_force_nonzero_ratio(sample),
+                    "activity_score": activity_score,
                     "action_pred_canonical": action_pred_canonical if report_action else None,
                     "action_gt_canonical": action_gt_canonical if report_action else None,
                     "action_valid": action_valid if report_action else None,
@@ -1105,7 +1099,7 @@ class Wan22Trainer:
                 force_pred_pressure=preview["force_pred_pressure"],
                 force_gt_pressure=preview["force_gt_pressure"],
                 force_valid=preview["force_valid"],
-                nonzero_ratio=preview["nonzero_ratio"],
+                activity_score=preview["activity_score"],
                 candidate_count=len(preview_candidates),
                 eligible_count=eligible_count,
             )
@@ -1147,7 +1141,7 @@ class Wan22Trainer:
                     "steps": self.print_prediction_steps,
                     "precision": self.print_prediction_precision,
                     "selection": self.print_prediction_selection,
-                    "min_force_nonzero_ratio": self.print_prediction_min_force_nonzero_ratio,
+                    "activity_top_fraction": self.print_prediction_activity_top_fraction,
                 },
                 "contract_hashes": getattr(self.val_dataset, "contract_hashes", {}),
             }

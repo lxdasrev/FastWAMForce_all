@@ -1,7 +1,7 @@
 import numpy as np
 
 from fastwam.datasets.opentouch.canonical import (
-    calibrate_and_clean_force,
+    DEFAULT_TWO_FINGER_TAXELS,
     canonicalize_hand_trajectory,
     normalize_force,
     pressure_to_two_finger,
@@ -39,7 +39,7 @@ def test_so3_log_rotation():
     assert np.allclose(so3_log(rotation), [0, 0, theta], atol=1e-6)
 
 
-def test_two_finger_invalid_taxels_are_not_averaged():
+def test_two_finger_direct_adc_deficit_and_invalid_taxels():
     raw = np.full((1, 16, 16), 3072, dtype=np.float32)
     raw[0, 2, 3] = 2072
     force, valid = pressure_to_two_finger(raw)
@@ -53,40 +53,36 @@ def test_two_finger_invalid_taxels_are_not_averaged():
     assert not broken_valid[0, 0]
 
 
-def test_per_demo_smooth_deadband_preserves_contact_dynamics():
-    baseline = np.array([100.0, 200.0], dtype=np.float32)
-    force = np.tile(baseline, (20, 1))
-    force[:8] += np.array([
-        [-2, 1], [2, -1], [0, 0], [1, 2], [-1, -2], [2, 1], [-2, 0], [0, -1],
-    ], dtype=np.float32)
-    force[8:, 0] += np.linspace(0, 100, 12)
-    force[8:, 1] += np.linspace(0, 200, 12)
-    valid = np.ones_like(force, dtype=bool)
-
-    clean, contact, estimated_baseline, noise = calibrate_and_clean_force(
-        force, valid, onset_idx=8,
-    )
-    assert np.allclose(estimated_baseline, baseline, atol=1.0)
-    assert np.all(noise >= 5.0)
-    assert np.allclose(clean[:8], 0.0)
-    assert not contact[:8].any()
-    assert np.all(np.diff(clean[9:, 0]) >= 0)
-    assert clean[-1, 1] > clean[-1, 0] > 0
+def test_two_finger_adc_reference_and_above_reference_are_valid_no_contact():
+    raw = np.full((3, 16, 16), 3072.0, dtype=np.float32)
+    raw[0] = 3000.0
+    raw[2] = 3100.0
+    force, valid = pressure_to_two_finger(raw)
+    assert valid.all()
+    assert np.allclose(force[0], 72.0)
+    assert np.allclose(force[1:], 0.0)
 
 
-def test_per_demo_smooth_deadband_removes_pure_noise_with_fallback_calibration():
-    rng = np.random.default_rng(7)
-    baseline = np.array([120.0, 240.0], dtype=np.float32)
-    force = baseline + rng.normal(0.0, 1.0, size=(64, 2)).astype(np.float32)
-    valid = np.ones_like(force, dtype=bool)
-    clean, contact, estimated_baseline, noise = calibrate_and_clean_force(force, valid)
-    assert np.allclose(estimated_baseline, baseline, atol=2.0)
-    assert np.all(noise == 5.0)
-    assert np.all(clean == 0.0)
-    assert not contact.any()
+def test_two_finger_valid_fraction_boundary_and_mask_coordinates():
+    assert len(DEFAULT_TWO_FINGER_TAXELS["thumb"]) == 11
+    assert len(DEFAULT_TWO_FINGER_TAXELS["index"]) == 6
+    assert DEFAULT_TWO_FINGER_TAXELS["thumb"][0] == (2, 3)
+    assert DEFAULT_TWO_FINGER_TAXELS["index"][0] == (6, 15)
+    raw = np.full((2, 16, 16), 3072.0, dtype=np.float32)
+    thumb = DEFAULT_TWO_FINGER_TAXELS["thumb"]
+    index = DEFAULT_TWO_FINGER_TAXELS["index"]
+    for row, col in thumb[:2]:
+        raw[0, row, col] = np.nan  # 9/11 remains valid.
+    for row, col in thumb[:3]:
+        raw[1, row, col] = np.nan  # 8/11 is below 80%.
+    raw[0, index[0][0], index[0][1]] = 0.0  # 5/6 remains valid.
+    for row, col in index[:2]:
+        raw[1, row, col] = np.inf  # 4/6 is below 80%.
+    _, valid = pressure_to_two_finger(raw)
+    assert valid.tolist() == [[True, True], [False, False]]
 
 
-def test_force_v2_normalization_bounds_and_round_trip():
+def test_force_v3_normalization_bounds_and_round_trip():
     knee = np.array([10.0, 20.0], dtype=np.float32)
     upper = np.array([100.0, 200.0], dtype=np.float32)
     normalization_max = np.arcsinh(upper / knee)
@@ -104,15 +100,3 @@ def test_force_v2_normalization_bounds_and_round_trip():
     assert np.allclose(normalized[3], 1.0)
     restored = np.sinh(normalized[:3] * normalization_max) * knee
     assert np.allclose(restored, clean[:3], atol=1e-5)
-
-
-def test_force_cleaning_keeps_single_finger_invalid_masked():
-    force = np.full((12, 2), 100.0, dtype=np.float32)
-    force[8:, 0] = 200.0
-    force[:, 1] = 999.0
-    valid = np.ones((12, 2), dtype=bool)
-    valid[:, 1] = False
-    clean, contact, _, _ = calibrate_and_clean_force(force, valid, onset_idx=8)
-    assert np.all(clean[:, 1] == 0)
-    assert not contact[:, 1].any()
-    assert contact[-1, 0]

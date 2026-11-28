@@ -68,6 +68,9 @@ def main(cfg: DictConfig):
             output_dir / "eval",
             samples=int(cfg.evaluation.get("bootstrap_samples", 10000)),
             seed=int(cfg.seed),
+            activity_top_fraction=float(
+                cfg.evaluation.get("print_prediction_activity_top_fraction", 0.5)
+            ),
         )
         (output_dir / "bootstrap_summary.json").write_text(
             json.dumps(summary, indent=2), encoding="utf-8"

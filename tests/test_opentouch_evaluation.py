@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 import torch
 from omegaconf import OmegaConf
 
@@ -119,7 +120,7 @@ class _FakeDataset:
         }
 
 
-def _cfg(stage, *, print_predictions=True, print_steps=32, selection="contact_random"):
+def _cfg(stage, *, print_predictions=True, print_steps=32, selection="activity_random"):
     return OmegaConf.create({
         "seed": 42,
         "eval_num_inference_steps": 2,
@@ -133,7 +134,7 @@ def _cfg(stage, *, print_predictions=True, print_steps=32, selection="contact_ra
             "print_prediction_steps": print_steps,
             "print_prediction_precision": 5,
             "print_prediction_selection": selection,
-            "print_prediction_min_force_nonzero_ratio": 0.25,
+            "print_prediction_activity_top_fraction": 0.5,
         },
     })
 
@@ -181,11 +182,11 @@ def test_action_only_opentouch_evaluation_never_generates_video(tmp_path):
     assert model.force_calls == 0
     assert metrics["generation_action_mse_normalized"] == 0.0
     assert "ACTION canonical" in log
-    assert "selection=contact_random" in log
-    assert "future_force_nonzero_ratio=0.0000" in log
-    assert "candidate_count=1 eligible_count=0" in log
+    assert "selection=activity_random" in log
+    assert "future_force_activity_score=0.0000" in log
+    assert "candidate_count=1 eligible_count=1" in log
     assert "pred=[1.00000, 1.00000, 1.00000, 1.00000, 1.00000, 1.00000, 1.00000]" in log
-    assert "FORCE baseline_corrected_relative_pressure" not in log
+    assert "FORCE relative_pressure_3072_minus_adc" not in log
 
 
 def test_force_warmup_reports_force_without_action_metric(tmp_path):
@@ -205,7 +206,7 @@ def test_force_warmup_reports_force_without_action_metric(tmp_path):
     assert metrics["generation_force_mse_normalized"] == 0.0
     assert "generation_action_mse_normalized" not in metrics
     assert "ACTION canonical" not in log
-    assert "FORCE baseline_corrected_relative_pressure" in log
+    assert "FORCE relative_pressure_3072_minus_adc" in log
     assert "pred=[2.00000, 2.00000]" in log
 
 
@@ -226,7 +227,7 @@ def test_force_joint_h0_and_h16_use_action_force_path(tmp_path):
         assert metrics["generation_action_mse_normalized"] == 0.0
         assert metrics["generation_force_mse_normalized"] == 0.0
         assert "ACTION canonical" in log
-        assert "FORCE baseline_corrected_relative_pressure" in log
+        assert "FORCE relative_pressure_3072_minus_adc" in log
         assert f"history_frames={history}" in log
         assert f"observed_force_frames={history + 1}" in log
 
@@ -265,56 +266,67 @@ def test_prediction_log_can_be_disabled_and_only_main_process_prints(tmp_path):
         assert "[opentouch-prediction]" not in _prediction_log(info)
 
 
-def test_contact_random_preview_is_reproducible_and_filters_low_contact():
+def test_obsolete_contact_preview_mode_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match="obsolete"):
+        Wan22Trainer.evaluation_only(
+            _FakeModel(force_enabled=True),
+            _FakeDataset(tmp_path / "normalization.npz"),
+            cfg=_cfg("joint", selection="contact_random"),
+            accelerator=_FakeAccelerator(),
+            output_dir=str(tmp_path),
+        )
+
+
+def test_activity_random_preview_is_reproducible_and_uses_top_fraction():
     runner = Wan22Trainer.__new__(Wan22Trainer)
     runner.seed = 42
     runner.global_step = 2000
     runner.print_prediction_samples = 2
-    runner.print_prediction_selection = "contact_random"
-    runner.print_prediction_min_force_nonzero_ratio = 0.25
+    runner.print_prediction_selection = "activity_random"
+    runner.print_prediction_activity_top_fraction = 0.5
     candidates = [
-        {"name": "mostly_zero", "nonzero_ratio": 0.05},
-        {"name": "contact_a", "nonzero_ratio": 0.50},
-        {"name": "contact_b", "nonzero_ratio": 0.75},
-        {"name": "contact_c", "nonzero_ratio": 0.30},
+        {"name": "mostly_constant", "activity_score": 0.05},
+        {"name": "activity_a", "activity_score": 0.50},
+        {"name": "activity_b", "activity_score": 0.75},
+        {"name": "activity_c", "activity_score": 0.30},
     ]
     selected_a, eligible_a = runner._select_prediction_previews(candidates)
     selected_b, eligible_b = runner._select_prediction_previews(candidates)
-    assert eligible_a == eligible_b == 3
+    assert eligible_a == eligible_b == 2
     assert [item["name"] for item in selected_a] == [item["name"] for item in selected_b]
-    assert all(item["nonzero_ratio"] >= 0.25 for item in selected_a)
+    assert all(item["activity_score"] >= 0.50 for item in selected_a)
 
 
-def test_contact_random_falls_back_to_highest_contact():
+def test_activity_random_all_constant_falls_back_to_stable_highest():
     runner = Wan22Trainer.__new__(Wan22Trainer)
     runner.seed = 42
     runner.global_step = 2000
     runner.print_prediction_samples = 1
-    runner.print_prediction_selection = "contact_random"
-    runner.print_prediction_min_force_nonzero_ratio = 0.90
+    runner.print_prediction_selection = "activity_random"
+    runner.print_prediction_activity_top_fraction = 0.5
     selected, eligible = runner._select_prediction_previews([
-        {"name": "low", "nonzero_ratio": 0.05},
-        {"name": "best", "nonzero_ratio": 0.40},
-        {"name": "middle", "nonzero_ratio": 0.20},
+        {"name": "first", "activity_score": 0.0},
+        {"name": "second", "activity_score": 0.0},
+        {"name": "third", "activity_score": 0.0},
     ])
-    assert eligible == 0
-    assert selected[0]["name"] == "best"
+    assert eligible == 1
+    assert selected[0]["name"] == "first"
 
 
-def test_fixed_max_contact_and_random_preview_modes():
+def test_fixed_max_activity_and_random_preview_modes():
     runner = Wan22Trainer.__new__(Wan22Trainer)
     runner.seed = 9
     runner.global_step = 2000
     runner.print_prediction_samples = 1
-    runner.print_prediction_min_force_nonzero_ratio = 0.25
+    runner.print_prediction_activity_top_fraction = 0.5
     candidates = [
-        {"name": "first", "nonzero_ratio": 0.10},
-        {"name": "best", "nonzero_ratio": 0.80},
-        {"name": "other", "nonzero_ratio": 0.40},
+        {"name": "first", "activity_score": 0.10},
+        {"name": "best", "activity_score": 0.80},
+        {"name": "other", "activity_score": 0.40},
     ]
     runner.print_prediction_selection = "fixed"
     assert runner._select_prediction_previews(candidates)[0][0]["name"] == "first"
-    runner.print_prediction_selection = "max_contact"
+    runner.print_prediction_selection = "max_activity"
     assert runner._select_prediction_previews(candidates)[0][0]["name"] == "best"
     runner.print_prediction_selection = "random"
     first = runner._select_prediction_previews(candidates)[0][0]["name"]
@@ -322,25 +334,22 @@ def test_fixed_max_contact_and_random_preview_modes():
     assert first == second
 
 
-def test_future_force_nonzero_ratio_uses_contact_validity_and_padding():
+def test_future_force_activity_score_uses_validity_and_padding():
     force = torch.zeros(1, 5, 2)
     valid = torch.ones(1, 5, 2, dtype=torch.bool)
     is_pad = torch.zeros(1, 5, 2, dtype=torch.bool)
-    contact = torch.zeros(1, 5, 2, dtype=torch.bool)
-    contact[0, 1, 0] = True
-    contact[0, 2, 0] = True
-    contact[0, 3, 1] = True
+    force[0, 1:, 0] = torch.tensor([0.1, 0.9, 0.5, 0.7])
+    force[0, 1:, 1] = torch.tensor([0.2, 0.4, 0.8, 1.0])
     valid[0, 2, 0] = False
     is_pad[0, 4, 1] = True
     sample = {
         "force": force,
         "force_valid": valid,
         "force_is_pad": is_pad,
-        "force_contact": contact,
         "force_observed_frames": 1,
     }
-    # Six valid future elements remain; two valid contact elements count.
-    assert np.isclose(Wan22Trainer._future_force_nonzero_ratio(sample), 2.0 / 6.0)
+    # thumb valid range: 0.7-0.1=0.6; index valid range: 0.8-0.2=0.6.
+    assert np.isclose(Wan22Trainer._future_force_activity_score(sample), 0.6)
 
 
 def test_bridge_diagnostics_are_aggregated_and_printed():
